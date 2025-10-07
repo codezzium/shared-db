@@ -89,6 +89,53 @@ def sha256sums(directory: pathlib.Path):
         print(f"[WARN] Checksum generation failed: {e}")
 
 
+def move_existing_to_olds(remote_path: str):
+    """
+    Check if backup already exists in cloud, if so move to olds/HH_MM/ subfolder.
+    This prevents overwriting same-day backups.
+    
+    Args:
+        remote_path: Remote path to check (e.g. records/2025/10/7)
+    """
+    # Check if any .sql files exist in the target path
+    result = run(
+        ["rclone", "lsf", f"{RCLONE_REMOTE}{remote_path}", "--files-only"],
+        capture=True,
+        check=False,
+    )
+    
+    if result.returncode != 0 or not result.stdout.strip():
+        # No existing backup, safe to proceed
+        return
+    
+    files = result.stdout.decode().strip().split("\n")
+    sql_files = [f for f in files if f.endswith(".sql")]
+    
+    if not sql_files:
+        # No SQL files, safe to proceed
+        return
+    
+    # Existing backup found, move to olds/HH_MM/
+    now = datetime.datetime.now()
+    olds_path = f"{remote_path}/olds/{now.strftime('%H_%M')}"
+    
+    print(f"[ARCHIVE] Existing backup found, moving to: {olds_path}")
+    
+    # Move all files from current path to olds subfolder
+    run(
+        [
+            "rclone",
+            "move",
+            f"{RCLONE_REMOTE}{remote_path}",
+            f"{RCLONE_REMOTE}{olds_path}",
+            "--exclude", "olds/**",  # Don't move existing olds folder
+        ],
+        check=False,
+    )
+    
+    print(f"[OK] Previous backup archived to: {olds_path}")
+
+
 def upload_to_cloud(local_dir: pathlib.Path, remote_path: str):
     """
     Upload backup directory to cloud storage using rclone.
@@ -199,6 +246,10 @@ def backup_all_databases():
         
         # Upload to cloud
         try:
+            # Archive existing backup if any
+            move_existing_to_olds(f"records/{today_path}")
+            
+            # Upload new backup
             upload_to_cloud(temp_dir, f"records/{today_path}")
             result["cloud_uploaded"] = True
             print(f"[OK] Backup uploaded to cloud: records/{today_path}")

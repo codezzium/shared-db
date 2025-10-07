@@ -21,11 +21,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy all scripts
 COPY backup.py mkdb.py restore.py ./
 
-# Configure cron: Daily at 02:00 Istanbul time
-RUN echo '0 2 * * * python /app/backup.py >> /backups/backup.log 2>&1' > /etc/crontabs/root
+# Configure cron: Daily at 02:00 Istanbul time (output to stdout for docker logs)
+RUN echo '0 2 * * * python /app/backup.py 2>&1' > /etc/crontabs/root
 
 # Create necessary directories
-RUN mkdir -p /backups /root/.config/rclone
+RUN mkdir -p /root/.config/rclone
 
-# Start cron daemon
-CMD ["crond", "-f", "-L", "/backups/crond.log"]
+# Start cron daemon (log level 2 = show job starts/ends)
+CMD ["crond", "-f", "-l", "2"]
