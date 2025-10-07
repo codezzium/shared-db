@@ -1,0 +1,43 @@
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# Backup files (only temp logs, no actual backups stored locally)
+backups/
+
+# rclone config (contains OAuth tokens)
+rclone/rclone.conf
+rclone/*.conf
+
+# Docker volumes
+postgres_data/
+pgadmin_data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
