@@ -2,6 +2,11 @@
 
 Cloud-first PostgreSQL backup and restore system with automated daily backups, Google Drive integration, and zero local storage.
 
+# TODO:
+  - [ ] Docker içinde fazlalık olan cron işini django ya bırakılacak. 
+  - [ ] Django da çok daha iyi arayüz hazırlanacak, mümkünse api sağlanacak sadece. Ouath2 filan
+  - [ ] Yedekleme, restore etme filan bunları adım adım görmek istiyorum ön yüzde.
+
 ## 📋 Table of Contents
 
 - [Features](#-features)
