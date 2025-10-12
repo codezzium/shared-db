@@ -1,0 +1,83 @@
+{% extends "controlpanel/base.html" %}
+
+{% block content %}
+<section class="grid">
+  <article class="card">
+    <h2>Durum</h2>
+    <dl class="status-list">
+      <div>
+        <dt>Son yedek</dt>
+        <dd>{{ latest_backup.date|default:"-" }}</dd>
+      </div>
+      <div>
+        <dt>Yedekler</dt>
+        <dd>{{ latest_backup.count|default:0 }} adet</dd>
+      </div>
+      <div>
+        <dt>Son cron çalışması</dt>
+        <dd>{{ cron.status }}</dd>
+      </div>
+      <div>
+        <dt>Cron kapsayıcısı</dt>
+        <dd>{{ cron.container }}</dd>
+      </div>
+      <div>
+        <dt>Yedek tazeliği</dt>
+        <dd>{{ cron.freshness }}</dd>
+      </div>
+    </dl>
+    {% if warnings %}
+      <ul class="warnings">
+        {% for item in warnings %}
+          <li>{{ item }}</li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  </article>
+
+  <article class="card">
+    <h2>Yedek Al</h2>
+    <form method="post" action="{% url 'controlpanel:trigger-backup' %}">
+      {% csrf_token %}
+      {{ backup_form.as_p }}
+      <button type="submit" class="btn primary">Yedeklemeyi Başlat</button>
+    </form>
+  </article>
+
+  <article class="card">
+    <h2>Yedekten Dön</h2>
+    <form method="post" action="{% url 'controlpanel:trigger-restore' %}">
+      {% csrf_token %}
+      {{ restore_form.as_p }}
+      <button type="submit" class="btn danger">Geri Yükle</button>
+    </form>
+    {% if databases %}
+      <p class="hint">Mevcut veritabanları: {{ databases|join:", " }}</p>
+    {% endif %}
+  </article>
+
+  <article class="card wide">
+    <h2>Buluttaki Yedekler</h2>
+    {% if backups %}
+      <table class="backups-table">
+        <thead>
+          <tr>
+            <th>Tarih</th>
+            <th>Dosyalar</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in backups %}
+            <tr>
+              <td>{{ item.date }}</td>
+              <td>{{ item.files|join:", " }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p>Henüz listenecek yedek bulunmuyor.</p>
+    {% endif %}
+  </article>
+</section>
+{% endblock %}

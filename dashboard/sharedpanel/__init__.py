@@ -1,0 +1,1 @@
+"""SharedPanel Django project package."""

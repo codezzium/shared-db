@@ -68,6 +68,31 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: shared-dashboard
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DJANGO_DATABASE: postgres
+      DJANGO_DB_HOST: db
+      DJANGO_DB_PORT: 5432
+      DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./dashboard:/app
+      - ./scripts:/app/scripts
+      - ./rclone:/root/.config/rclone
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - shared-db-net
+
 volumes:
   postgres_data:
   pgadmin_data:
