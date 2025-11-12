@@ -24,6 +24,30 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: shared-pgbouncer
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_HOST: db
+      DB_NAME: "*"
+      AUTH_TYPE: scram-sha-256
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "152.53.225.241:54937:5432"
+    networks:
+      - shared-db-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
   pgadmin:
     image: dpage/pgadmin4
     container_name: shared-pgadmin
