@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Quick database creator for new projects.
-Usage: docker-compose exec pgbackup python /app/mkdb.py <db_name>
+Usage: docker exec -it shared-pgbackup python /app/mkdb.py <database name>
 """
 import os
 import sys
