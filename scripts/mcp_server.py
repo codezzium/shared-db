@@ -246,6 +246,47 @@ def delete_database(dbname: str, confirm: bool = False) -> str:
     except Exception as e:
         return f"Error deleting database: {str(e)}"
 
+@mcp.tool()
+def run_sql(dbname: str, query: str, confirm: bool = False) -> str:
+    """
+    Run a raw SQL query on a database.
+    WARNING: This can be dangerous. Use with caution.
+
+    Args:
+        dbname: Name of the database to run the query on.
+        query: The SQL query to execute.
+        confirm: Set to True to confirm execution.
+    """
+    if not confirm:
+        return f"WARNING: You are about to execute the following SQL on database '{dbname}':\n\n{query}\n\nThis operation requires confirmation. Call again with confirm=True."
+
+    pg_host = os.getenv("POSTGRES_HOST")
+    pg_port = os.getenv("POSTGRES_PORT")
+    pg_user = os.getenv("POSTGRES_USER")
+    pg_password = os.getenv("POSTGRES_PASSWORD")
+
+    env = os.environ.copy()
+    if pg_password:
+        env["PGPASSWORD"] = pg_password
+
+    cmd = ["psql", "-h", pg_host, "-p", pg_port, "-U", pg_user, "-d", dbname, "-c", query]
+
+    try:
+        result = subprocess.run(cmd, env=env, check=True, capture_output=True, text=True)
+
+        output = []
+        if result.stdout:
+            output.append("STDOUT:\n" + result.stdout)
+        if result.stderr:
+            output.append("STDERR:\n" + result.stderr)
+
+        return "\n".join(output) if output else "Query executed successfully (no output)."
+
+    except subprocess.CalledProcessError as e:
+        return f"SQL execution failed:\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}"
+    except Exception as e:
+        return f"Error executing SQL: {str(e)}"
+
 def main():
     # Initialize and run the server
     mcp.run(transport="sse")
