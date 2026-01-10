@@ -15,9 +15,17 @@ from mcp.server.fastmcp import FastMCP
 import backup
 import mkdb
 import restore
+from mcp.server.transport_security import TransportSecuritySettings
+
+sec = TransportSecuritySettings(
+    enable_dns_rebinding_protection=False,
+    allowed_hosts=["127.0.0.1:*", "*", "[::1]:*"],
+    allowed_origins=["*", "http://localhost:*", "http://[::1]:*"],
+)
+
 
 # Initialize FastMCP server
-mcp = FastMCP("Postgres Manager")
+mcp = FastMCP("Postgres Manager", host="0.0.0.0", port=8080, transport_security=sec)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -167,3 +175,11 @@ def restore_database(dbname: str, date: Optional[str] = None) -> str:
 
     except Exception as e:
         return f"Restore failed: {str(e)}\nLog:\n{output_log.getvalue()}"
+
+def main():
+    # Initialize and run the server
+    mcp.run(transport="sse")
+
+
+if __name__ == "__main__":
+    main()
