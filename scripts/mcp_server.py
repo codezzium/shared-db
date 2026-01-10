@@ -7,6 +7,7 @@ import io
 import datetime
 import tempfile
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional, List
 from mcp.server.fastmcp import FastMCP
@@ -15,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 import backup
 import mkdb
 import restore
+import clone
 from mcp.server.transport_security import TransportSecuritySettings
 
 sec = TransportSecuritySettings(
@@ -175,6 +177,74 @@ def restore_database(dbname: str, date: Optional[str] = None) -> str:
 
     except Exception as e:
         return f"Restore failed: {str(e)}\nLog:\n{output_log.getvalue()}"
+
+@mcp.tool()
+def clone_database(source_db: str, target_db: str) -> str:
+    """
+    Clone a database to a new database.
+
+    Args:
+        source_db: Name of the existing database to clone from.
+        target_db: Name of the new database to create.
+    """
+    if clone.db_exists(target_db):
+         return f"Error: Target database '{target_db}' already exists. Clone aborted."
+
+    if not clone.db_exists(source_db):
+        return f"Error: Source database '{source_db}' does not exist."
+
+    try:
+        clone.create_db(target_db)
+        clone.clone_db(source_db, target_db)
+        return f"Successfully cloned '{source_db}' to '{target_db}'"
+    except Exception as e:
+        return f"Clone failed: {str(e)}"
+
+@mcp.tool()
+def delete_database(dbname: str, confirm: bool = False) -> str:
+    """
+    Delete a database. Requires confirmation.
+
+    Args:
+        dbname: Name of the database to delete.
+        confirm: Set to True to confirm deletion.
+    """
+    if not confirm:
+        return f"WARNING: Database '{dbname}' will be PERMANENTLY DELETED. This cannot be undone.\nTo proceed, please call this function again with confirm=True."
+
+    if not restore.db_exists(dbname):
+        return f"Database '{dbname}' does not exist."
+
+    try:
+        # Terminate connections first
+        restore.terminate_connections(dbname)
+
+        # Drop database using subprocess directly or via a helper
+        # restore.drop_create_db drops and creates, we just want drop.
+        # We can use subprocess here directly or define a helper.
+        # Let's use subprocess directly for simplicity as we have access to env vars via os.environ if needed,
+        # but better to use the pattern in restore.py/mkdb.py if possible.
+        # restore.run is not easily importable as a standalone without 'restore.' prefix.
+
+        pg_host = os.getenv("POSTGRES_HOST")
+        pg_port = os.getenv("POSTGRES_PORT")
+        pg_user = os.getenv("POSTGRES_USER")
+        pg_password = os.getenv("POSTGRES_PASSWORD")
+
+        env = os.environ.copy()
+        if pg_password:
+            env["PGPASSWORD"] = pg_password
+
+        cmd = ["dropdb", "-h", pg_host, "-p", pg_port, "-U", pg_user, dbname]
+
+        subprocess.run(cmd, env=env, check=True, capture_output=True, text=True)
+
+        return f"Database '{dbname}' successfully deleted."
+
+    except subprocess.CalledProcessError as e:
+        return f"Failed to delete database: {e.stderr}"
+    except Exception as e:
+        return f"Error deleting database: {str(e)}"
 
 def main():
     # Initialize and run the server
