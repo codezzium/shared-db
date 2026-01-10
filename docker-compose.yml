@@ -92,6 +92,28 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  mcp-server:
+    build: ./scripts
+    container_name: shared-mcp-server
+    restart: unless-stopped
+    env_file: .env
+    command: python3 mcp_server.py
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./rclone:/root/.config/rclone
+      - ./scripts:/app
+    ports:
+      - "8080:8080"
+    networks:
+      - shared-db-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
   # dashboard:
   #   build:
   #     context: .

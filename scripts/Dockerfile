@@ -19,7 +19,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy all scripts
-COPY backup.py mkdb.py restore.py ./
+COPY backup.py mkdb.py restore.py clone.py mcp_server.py ./
 
 # Configure cron: Daily at 02:00 Istanbul time (output to stdout for docker logs)
 RUN echo '0 2 * * * python /app/backup.py 2>&1' > /etc/crontabs/root
