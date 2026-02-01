@@ -47,10 +47,11 @@ def db_exists(dbname: str) -> bool:
 
 
 def create_db(dbname: str):
-    """Create a new database"""
+    """Create a new database with Turkish ICU collation settings"""
     print(f"[CREATE] Creating database: {dbname}")
     run([
-        "createdb", "-h", PGHOST, "-p", PGPORT, "-U", PGUSER, dbname
+        "psql", "-h", PGHOST, "-p", PGPORT, "-U", PGUSER, "-d", "postgres",
+        "-c", f"CREATE DATABASE {dbname} WITH LOCALE_PROVIDER=icu ICU_LOCALE='tr-TR' TEMPLATE=template0;"
     ])
 
 
