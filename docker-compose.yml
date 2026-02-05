@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:17
+    image: pgvector/pgvector:pg18-trixie
     container_name: shared-db
     restart: unless-stopped
     shm_size: 512mb
@@ -10,7 +10,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d postgres -h localhost -p 5432" ]
       interval: 10s
@@ -53,25 +53,25 @@ services:
         max-size: "50m"
         max-file: "3"
 
-  pgadmin:
-    image: dpage/pgadmin4
-    container_name: shared-pgadmin
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
-      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
-    ports:
-      - "127.0.0.1:9090:80"
-    depends_on:
-      db:
-        condition: service_healthy
-    volumes:
-      - pgadmin_data:/var/lib/pgadmin
-    networks:
-      - shared-db-net
-    logging:
-      driver: "none"
+  # pgadmin:
+  #   image: dpage/pgadmin4
+  #   container_name: shared-pgadmin
+  #   restart: unless-stopped
+  #   env_file: .env
+  #   environment:
+  #     PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+  #     PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+  #   ports:
+  #     - "127.0.0.1:9090:80"
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+  #   volumes:
+  #     - pgadmin_data:/var/lib/pgadmin
+  #   networks:
+  #     - shared-db-net
+  #   logging:
+  #     driver: "none"
 
   pgbackup:
     build: ./scripts
