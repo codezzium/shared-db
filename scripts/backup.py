@@ -201,6 +201,77 @@ def prune_cloud_backups(days: int):
     print("[OK] Cloud cleanup completed")
 
 
+def backup_single_database(dbname: str):
+    """
+    Backup a single database to cloud storage (records/YYYY/MM/DD/).
+    Unlike backup_all_databases, this only uploads the single .sql file
+    without archiving or touching other files in the same date folder.
+
+    Returns dict with backup status.
+    """
+    import tempfile
+    import shutil
+
+    today = datetime.date.today()
+    today_path = f"{today.year}/{today.month}/{today.day}"
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    result = {
+        "status": "success",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "cloud_path": f"records/{today_path}",
+        "database": dbname,
+        "errors": []
+    }
+
+    temp_dir = pathlib.Path(tempfile.mkdtemp(prefix=f"backup_{dbname}_{timestamp}_"))
+
+    try:
+        print(f"[{result['timestamp']}] Single database backup started: {dbname}")
+        print(f"[TEMP] Using temporary directory: {temp_dir}")
+
+        # Dump the single database
+        output_file = temp_dir / f"{dbname}.sql"
+        dump_single_db(dbname, output_file)
+
+        # Upload only this file to cloud (rclone copy merges, won't touch other files)
+        try:
+            print(f"[UPLOAD] Uploading {dbname}.sql to {RCLONE_REMOTE}records/{today_path}")
+            run(
+                [
+                    "rclone", "copy",
+                    str(temp_dir),
+                    f"{RCLONE_REMOTE}records/{today_path}",
+                    "--progress",
+                ]
+            )
+            result["cloud_uploaded"] = True
+            print(f"[OK] Uploaded: records/{today_path}/{dbname}.sql")
+        except subprocess.CalledProcessError as e:
+            error_msg = f"Cloud upload failed: {e}"
+            print(f"[ERROR] {error_msg}")
+            result["errors"].append(error_msg)
+            result["cloud_uploaded"] = False
+
+        if result["errors"]:
+            result["status"] = "partial"
+
+        print(f"[{datetime.datetime.now().isoformat()}] Single database backup completed: {dbname}")
+
+    except Exception as e:
+        result["status"] = "failed"
+        result["errors"].append(str(e))
+        print(f"[ERROR] Backup failed: {e}")
+        raise
+
+    finally:
+        if temp_dir.exists():
+            print(f"[CLEANUP] Removing temporary files: {temp_dir}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return result
+
+
 def backup_all_databases():
     """
     Main backup function: dump all databases to temp, upload to cloud, cleanup temp.
@@ -284,16 +355,30 @@ def backup_all_databases():
 
 
 def main():
-    """CLI entry point for automated cron jobs"""
+    """
+    CLI entry point.
+
+    Usage:
+      python backup.py              # Backup all databases (cron mode)
+      python backup.py <dbname>     # Backup a single database
+      python backup.py --json       # Output JSON result
+    """
     try:
-        result = backup_all_databases()
-        
-        # Optional: output JSON for parsing by external tools
-        if "--json" in sys.argv:
+        # Check if a database name was given (first non-flag argument)
+        args = [a for a in sys.argv[1:] if not a.startswith("--")]
+        json_output = "--json" in sys.argv
+
+        if args:
+            dbname = args[0]
+            result = backup_single_database(dbname)
+        else:
+            result = backup_all_databases()
+
+        if json_output:
             print(json.dumps(result, indent=2))
-        
+
         sys.exit(0 if result["status"] in ["success", "partial"] else 1)
-        
+
     except subprocess.CalledProcessError as e:
         sys.stderr.write((e.stdout or b"").decode())
         sys.exit(e.returncode)

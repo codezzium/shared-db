@@ -80,29 +80,12 @@ def backup_all_databases() -> str:
 
 @mcp.tool()
 def backup_database(dbname: str) -> str:
-    """Create a manual backup of a single database."""
-
-    today = datetime.date.today()
-    timestamp = datetime.datetime.now().strftime("%H-%M-%S")
-    remote_path = f"manual_backups/{today.year}/{today.month}/{today.day}"
-
-    temp_dir = Path(tempfile.mkdtemp(prefix=f"manual_backup_{dbname}_"))
+    """Create a backup of a single database and upload to cloud (records/)."""
     try:
-        logger.info(f"Starting manual backup for {dbname}")
-        output_file = temp_dir / f"{dbname}.sql"
-
-        # Dump
-        backup.dump_single_db(dbname, output_file)
-
-        # Upload
-        backup.upload_to_cloud(temp_dir, remote_path)
-
-        return f"Successfully backed up {dbname} to {backup.RCLONE_REMOTE}{remote_path}/{dbname}.sql"
-
+        result = backup.backup_single_database(dbname)
+        return json.dumps(result, indent=2)
     except Exception as e:
-        return f"Manual backup failed: {str(e)}"
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        return f"Backup failed: {str(e)}"
 
 @mcp.tool()
 def list_backups() -> str:
@@ -147,7 +130,7 @@ def restore_database(dbname: str, date: Optional[str] = None) -> str:
             # For now, we rely on the functions running and raising exceptions on failure.
 
             log("Downloading backup...")
-            restore.download_from_cloud(date_folder, temp_dir)
+            restore.download_from_cloud(date_folder, temp_dir, dbname=dbname)
 
             if not (temp_dir / f"{dbname}.sql").exists():
                 raise Exception(f"Backup file for {dbname} not found in {date_folder}")

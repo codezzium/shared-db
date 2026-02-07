@@ -81,26 +81,38 @@ def latest_cloud_backup():
     return folders[0]
 
 
-def download_from_cloud(date_folder: str, local_temp_dir: pathlib.Path):
+def download_from_cloud(date_folder: str, local_temp_dir: pathlib.Path, dbname: str | None = None):
     """
-    Download backup folder from cloud to local temp directory.
-    
+    Download backup from cloud to local temp directory.
+
     Args:
         date_folder: Date folder path (e.g. "2025/10/7")
         local_temp_dir: Local temporary directory to download to
+        dbname: If specified, download only this database's .sql file
     """
-    print(f"[DOWNLOAD] Fetching backup from cloud: {date_folder}")
-    
-    run(
-        [
-            "rclone",
-            "copy",
-            f"{RCLONE_REMOTE}records/{date_folder}",
-            str(local_temp_dir),
-            "--progress",
-        ]
-    )
-    
+    if dbname:
+        print(f"[DOWNLOAD] Fetching {dbname}.sql from cloud: {date_folder}")
+        run(
+            [
+                "rclone",
+                "copy",
+                f"{RCLONE_REMOTE}records/{date_folder}/{dbname}.sql",
+                str(local_temp_dir),
+                "--progress",
+            ]
+        )
+    else:
+        print(f"[DOWNLOAD] Fetching full backup from cloud: {date_folder}")
+        run(
+            [
+                "rclone",
+                "copy",
+                f"{RCLONE_REMOTE}records/{date_folder}",
+                str(local_temp_dir),
+                "--progress",
+            ]
+        )
+
     print(f"[OK] Download completed: {local_temp_dir}")
 
 
@@ -148,39 +160,37 @@ def find_cloud_backup(date_arg: str | None) -> str:
     return latest_cloud_backup()
 
 
+def check_file_in_cloud(date_folder: str, filename: str) -> bool:
+    """
+    Check if a specific file exists in a cloud backup folder using rclone lsf.
+    No download needed — just lists remote files.
+    """
+    result = run(
+        ["rclone", "lsf", f"{RCLONE_REMOTE}records/{date_folder}", "--files-only"],
+        capture=True,
+        check=False,
+        quiet=True,
+    )
+    if result.returncode != 0:
+        return False
+    files = result.stdout.decode().strip().split("\n")
+    return filename in files
+
+
 def guess_latest_cloud_backup_for_db(db: str) -> str:
     """
     Find the most recent cloud backup containing SQL dump for specified database.
-    Downloads and checks each backup (newest first) until database is found.
+    Uses rclone lsf to check file existence (no download needed).
     """
     cloud_folders = list_cloud_backups()
-    
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = pathlib.Path(temp_dir)
-        
-        # Search backwards (newest first)
-        for date_folder in reversed(cloud_folders):
-            print(f"[SEARCH] Checking {date_folder} for {db}.sql...")
-            
-            # Download to check contents
-            try:
-                download_from_cloud(date_folder, temp_path)
-                
-                if (temp_path / f"{db}.sql").exists():
-                    print(f"[FOUND] Database backup found in: {date_folder}")
-                    return date_folder
-                
-                # Clean temp dir for next iteration
-                for item in temp_path.iterdir():
-                    if item.is_file():
-                        item.unlink()
-                    elif item.is_dir():
-                        shutil.rmtree(item)
-                        
-            except subprocess.CalledProcessError:
-                print(f"[WARN] Could not check {date_folder}")
-                continue
-    
+
+    for date_folder in cloud_folders:
+        print(f"[SEARCH] Checking {date_folder} for {db}.sql...")
+
+        if check_file_in_cloud(date_folder, f"{db}.sql"):
+            print(f"[FOUND] Database backup found in: {date_folder}")
+            return date_folder
+
     sys.exit(f"ERROR: No backup found for database '{db}' in cloud storage")
 
 
@@ -394,16 +404,14 @@ Examples:
     print(f"[INFO] Server        : {PGUSER}@{PGHOST}:{PGPORT}")
     print("="*60 + "\n")
 
-    # Download backup from cloud to temp directory
+    # Download only the single .sql file from cloud
     temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="restore_"))
     try:
-        download_from_cloud(date_folder, temp_dir)
-        
-        # Verify backup contains requested database
+        download_from_cloud(date_folder, temp_dir, dbname=db)
+
+        # Verify backup was downloaded
         if not (temp_dir / f"{db}.sql").exists():
-            candidates = sorted([p.name for p in temp_dir.glob("*.sql")])
-            hint = f"Available: {', '.join(candidates)}" if candidates else "No SQL files found"
-            sys.exit(f"ERROR: No backup for '{db}' in {date_folder}. {hint}")
+            sys.exit(f"ERROR: No backup for '{db}' in {date_folder}.")
 
         # Safety backup (before destructive operation)
         safety_cloud_path = None

@@ -44,7 +44,7 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "127.0.0.1:5432:5432"
+      - "${SERVER_URL-127.0.0.1:5432}:5432"
     networks:
       - shared-db-net
     logging:
