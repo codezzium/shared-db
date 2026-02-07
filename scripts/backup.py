@@ -331,9 +331,6 @@ def backup_all_databases():
             result["errors"].append(error_msg)
             result["cloud_uploaded"] = False
         
-        # Cleanup old cloud backups
-        prune_cloud_backups(RETENTION_DAYS)
-        
         if result["errors"]:
             result["status"] = "partial"
         

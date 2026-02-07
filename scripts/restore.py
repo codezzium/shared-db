@@ -432,9 +432,6 @@ Examples:
         # Verify
         list_tables(db)
 
-        # Cleanup old manual backups
-        cleanup_old_manual_backups(15)
-
         print("\n" + "="*60)
         print("[SUCCESS] Restore completed")
         if safety_cloud_path:
