@@ -44,7 +44,7 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "152.53.225.241:54937:5432"
+      - "127.0.0.1:5432:5432"
     networks:
       - shared-db-net
     logging:
@@ -110,7 +110,7 @@ services:
       - ./rclone:/root/.config/rclone
       - ./scripts:/app
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     networks:
       - shared-db-net
     logging:
