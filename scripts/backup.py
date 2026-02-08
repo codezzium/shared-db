@@ -16,6 +16,7 @@ PGUSER = os.getenv("POSTGRES_USER")
 PGPASSWORD = os.getenv("POSTGRES_PASSWORD")
 RETENTION_DAYS = int(os.getenv("BACKUP_RETENTION_DAYS", "15"))
 RCLONE_REMOTE = os.getenv("RCLONE_REMOTE", "grdive:")
+SERVER_NAME = os.getenv("SERVER_NAME", "default")
 
 
 def run(cmd, env=None, check=True, capture=False, cwd=None):
@@ -166,20 +167,21 @@ def prune_cloud_backups(days: int):
     """
     print(f"[CLOUD-CLEANUP] Checking for backups older than {days} days...")
     
+    base = f"records/{SERVER_NAME}/"
     # List all day-level directories recursively
     result = run(
-        ["rclone", "lsf", f"{RCLONE_REMOTE}records/", "--dirs-only", "--recursive"],
+        ["rclone", "lsf", f"{RCLONE_REMOTE}{base}", "--dirs-only", "--recursive"],
         capture=True,
         check=False,
     )
-    
+
     if result.returncode != 0:
         print("[WARN] Could not list cloud backups for cleanup")
         return
-    
+
     cutoff_date = datetime.date.today() - datetime.timedelta(days=days)
     folders = result.stdout.decode().strip().split("\n")
-    
+
     for folder in folders:
         folder = folder.rstrip("/")
         # Parse folder path: year/month/day
@@ -188,11 +190,11 @@ def prune_cloud_backups(days: int):
             try:
                 year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
                 folder_date = datetime.date(year, month, day)
-                
+
                 if folder_date < cutoff_date:
                     print(f"[CLOUD-DELETE] Removing old backup: {folder}")
                     run(
-                        ["rclone", "purge", f"{RCLONE_REMOTE}records/{folder}"],
+                        ["rclone", "purge", f"{RCLONE_REMOTE}{base}{folder}"],
                         check=False,
                     )
             except (ValueError, IndexError):
@@ -214,12 +216,13 @@ def backup_single_database(dbname: str):
 
     today = datetime.date.today()
     today_path = f"{today.year}/{today.month}/{today.day}"
+    remote_path = f"records/{SERVER_NAME}/{today_path}"
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     result = {
         "status": "success",
         "timestamp": datetime.datetime.now().isoformat(),
-        "cloud_path": f"records/{today_path}",
+        "cloud_path": remote_path,
         "database": dbname,
         "errors": []
     }
@@ -236,17 +239,17 @@ def backup_single_database(dbname: str):
 
         # Upload only this file to cloud (rclone copy merges, won't touch other files)
         try:
-            print(f"[UPLOAD] Uploading {dbname}.sql to {RCLONE_REMOTE}records/{today_path}")
+            print(f"[UPLOAD] Uploading {dbname}.sql to {RCLONE_REMOTE}{remote_path}")
             run(
                 [
                     "rclone", "copy",
                     str(temp_dir),
-                    f"{RCLONE_REMOTE}records/{today_path}",
+                    f"{RCLONE_REMOTE}{remote_path}",
                     "--progress",
                 ]
             )
             result["cloud_uploaded"] = True
-            print(f"[OK] Uploaded: records/{today_path}/{dbname}.sql")
+            print(f"[OK] Uploaded: {remote_path}/{dbname}.sql")
         except subprocess.CalledProcessError as e:
             error_msg = f"Cloud upload failed: {e}"
             print(f"[ERROR] {error_msg}")
@@ -282,23 +285,24 @@ def backup_all_databases():
     
     today = datetime.date.today()
     today_path = f"{today.year}/{today.month}/{today.day}"
+    remote_path = f"records/{SERVER_NAME}/{today_path}"
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    
+
     result = {
         "status": "success",
         "timestamp": datetime.datetime.now().isoformat(),
-        "cloud_path": f"records/{today_path}",
+        "cloud_path": remote_path,
         "databases": [],
         "errors": []
     }
-    
+
     # Create temporary directory for backup
     temp_dir = pathlib.Path(tempfile.mkdtemp(prefix=f"backup_{timestamp}_"))
-    
+
     try:
         print(f"[{result['timestamp']}] Backup started")
         print(f"[TEMP] Using temporary directory: {temp_dir}")
-        
+
         # Dump each database to temp
         databases = list_databases()
         for db in databases:
@@ -311,19 +315,19 @@ def backup_all_databases():
                 error_msg = f"Failed to dump {db}: {e}"
                 print(f"[ERROR] {error_msg}")
                 result["errors"].append(error_msg)
-        
+
         # Generate checksums
         sha256sums(temp_dir)
-        
+
         # Upload to cloud
         try:
             # Archive existing backup if any
-            move_existing_to_olds(f"records/{today_path}")
-            
+            move_existing_to_olds(remote_path)
+
             # Upload new backup
-            upload_to_cloud(temp_dir, f"records/{today_path}")
+            upload_to_cloud(temp_dir, remote_path)
             result["cloud_uploaded"] = True
-            print(f"[OK] Backup uploaded to cloud: records/{today_path}")
+            print(f"[OK] Backup uploaded to cloud: {remote_path}")
             
         except subprocess.CalledProcessError as e:
             error_msg = f"Cloud upload failed: {e}"

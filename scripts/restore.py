@@ -21,6 +21,7 @@ PGPORT = os.getenv("POSTGRES_PORT")
 PGUSER = os.getenv("POSTGRES_USER")
 PGPASSWORD = os.getenv("POSTGRES_PASSWORD")
 RCLONE_REMOTE = os.getenv("RCLONE_REMOTE", "grdive:")
+SERVER_NAME = os.getenv("SERVER_NAME", "default")
 
 
 def run(cmd, check=True, capture=False, cwd=None, quiet=False):
@@ -48,7 +49,7 @@ def list_cloud_backups():
     Returns list of paths like: ['2025/10/7', '2025/10/6', ...]
     """
     result = run(
-        ["rclone", "lsf", f"{RCLONE_REMOTE}records/", "--dirs-only", "--recursive"],
+        ["rclone", "lsf", f"{RCLONE_REMOTE}records/{SERVER_NAME}/", "--dirs-only", "--recursive"],
         capture=True,
         check=True,
     )
@@ -77,7 +78,7 @@ def latest_cloud_backup():
     """Get the most recent backup folder from cloud"""
     folders = list_cloud_backups()
     if not folders:
-        sys.exit(f"ERROR: No backups found in cloud storage: {RCLONE_REMOTE}records/")
+        sys.exit(f"ERROR: No backups found in cloud storage: {RCLONE_REMOTE}records/{SERVER_NAME}/")
     return folders[0]
 
 
@@ -96,7 +97,7 @@ def download_from_cloud(date_folder: str, local_temp_dir: pathlib.Path, dbname: 
             [
                 "rclone",
                 "copy",
-                f"{RCLONE_REMOTE}records/{date_folder}/{dbname}.sql",
+                f"{RCLONE_REMOTE}records/{SERVER_NAME}/{date_folder}/{dbname}.sql",
                 str(local_temp_dir),
                 "--progress",
             ]
@@ -107,7 +108,7 @@ def download_from_cloud(date_folder: str, local_temp_dir: pathlib.Path, dbname: 
             [
                 "rclone",
                 "copy",
-                f"{RCLONE_REMOTE}records/{date_folder}",
+                f"{RCLONE_REMOTE}records/{SERVER_NAME}/{date_folder}",
                 str(local_temp_dir),
                 "--progress",
             ]
@@ -166,7 +167,7 @@ def check_file_in_cloud(date_folder: str, filename: str) -> bool:
     No download needed — just lists remote files.
     """
     result = run(
-        ["rclone", "lsf", f"{RCLONE_REMOTE}records/{date_folder}", "--files-only"],
+        ["rclone", "lsf", f"{RCLONE_REMOTE}records/{SERVER_NAME}/{date_folder}", "--files-only"],
         capture=True,
         check=False,
         quiet=True,
@@ -238,7 +239,7 @@ def safety_backup_before_restore(db: str) -> str | None:
     today = datetime.date.today()
     timestamp = datetime.datetime.now().strftime("%H-%M-%S")
     filename = f"{db}_before_restore_{timestamp}.sql"
-    cloud_path = f"manual_backups/{today.year}/{today.month}/{today.day}"
+    cloud_path = f"manual_backups/{SERVER_NAME}/{today.year}/{today.month}/{today.day}"
     
     # Create temp file for safety backup
     temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="safety_backup_"))
@@ -338,7 +339,7 @@ def cleanup_old_manual_backups(days: int = 15):
     print(f"[CLOUD-CLEANUP] Checking cloud manual backups older than {days} days...")
     try:
         result = run(
-            ["rclone", "lsf", f"{RCLONE_REMOTE}manual_backups/", "--dirs-only", "--recursive"],
+            ["rclone", "lsf", f"{RCLONE_REMOTE}manual_backups/{SERVER_NAME}/", "--dirs-only", "--recursive"],
             capture=True,
             check=False,
         )
@@ -358,7 +359,7 @@ def cleanup_old_manual_backups(days: int = 15):
                         if folder_date < cutoff_date:
                             print(f"[CLOUD-DELETE] {folder}")
                             run(
-                                ["rclone", "purge", f"{RCLONE_REMOTE}manual_backups/{folder}"],
+                                ["rclone", "purge", f"{RCLONE_REMOTE}manual_backups/{SERVER_NAME}/{folder}"],
                                 check=False,
                             )
                     except (ValueError, IndexError):
@@ -399,7 +400,7 @@ Examples:
         date_folder = guess_latest_cloud_backup_for_db(db)
 
     print("="*60)
-    print(f"[INFO] Source       : {RCLONE_REMOTE}records/{date_folder}")
+    print(f"[INFO] Source       : {RCLONE_REMOTE}records/{SERVER_NAME}/{date_folder}")
     print(f"[INFO] Target database: {db}")
     print(f"[INFO] Server        : {PGUSER}@{PGHOST}:{PGPORT}")
     print("="*60 + "\n")
