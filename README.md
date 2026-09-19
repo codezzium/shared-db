@@ -32,7 +32,6 @@ Cloud-first PostgreSQL backup and restore system with automated daily backups, G
 - **♻️ Smart Archiving**: Multiple same-day backups archived in `olds/HH_MM/` subfolders
 - **🚀 Zero Local Storage**: Temp files only, auto-cleaned after operations
 - **📊 pgAdmin Integration**: Web UI for database management
-- **🖥️ Django Control Panel**: Trigger backups/restores and monitor cron health from a web UI
 
 ---
 
@@ -240,21 +239,6 @@ docker-compose exec pgbackup python /app/restore.py my_django_db 2025/10/7
 docker-compose exec pgbackup python /app/restore.py my_django_db --skip-safety-backup
 ```
 
-### Django Web Panel
-
-1. `.env` dosyanıza yeni değişkenleri ekleyin (`DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`, `DJANGO_DATABASE`).
-2. Paneli ayağa kaldırın:
-   ```bash
-   docker-compose up -d dashboard
-   docker-compose exec dashboard python manage.py migrate
-   ```
-3. Tarayıcıdan `http://localhost:8000` adresine gidin.
-4. Panel üzerinden:
-   - Manuel yedek başlatabilir,
-   - Yedekten dönebilir,
-   - Buluttaki yedekleri ve cron sağlık durumunu izleyebilirsiniz.
-   > Not: Cron sağlığını gösterebilmek için `dashboard` servisi docker socket'ini paylaşıyor (`/var/run/docker.sock`).
-
 ### Access pgAdmin
 
 1. Open browser: `http://localhost:9090`
@@ -294,13 +278,6 @@ shared-db/
 ├── .env                        # Environment variables (NEVER commit!)
 ├── .gitignore                  # Git ignore rules
 ├── README.md                   # This file
-│
-├── dashboard/
-│   ├── Dockerfile              # Django panel container image
-│   ├── manage.py               # Django management utility
-│   ├── requirements.txt        # Web UI dependencies
-│   ├── sharedpanel/            # Project settings
-│   └── controlpanel/           # Backup dashboard app (views, templates)
 │
 ├── rclone/
 │   └── rclone.conf             # rclone OAuth tokens (NEVER commit!)
