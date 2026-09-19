@@ -15,6 +15,7 @@ import shutil
 
 # Import reusable dump function from backup.py
 from backup import dump_single_db
+from mkdb import connect, create_database, role_exists
 
 PGHOST = os.getenv("POSTGRES_HOST")
 PGPORT = os.getenv("POSTGRES_PORT")
@@ -275,10 +276,16 @@ def safety_backup_before_restore(db: str) -> str | None:
 def drop_create_db(db: str):
     """Drop and recreate database"""
     print(f"[DROP] Dropping database: {db}")
-    run(["dropdb", "-h", PGHOST, "-p", PGPORT, "-U", PGUSER, db], check=False)
+    run(["dropdb", "-h", PGHOST, "-p", PGPORT, "-U", PGUSER, "--force", db], check=False)
     
     print(f"[CREATE] Creating fresh database: {db}")
-    run(["createdb", "-h", PGHOST, "-p", PGPORT, "-U", PGUSER, db])
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            owner = db if role_exists(cur, db) else PGUSER
+            create_database(cur, db, owner)
+    finally:
+        conn.close()
 
 
 def restore_from_folder(db: str, folder: pathlib.Path, cleanup_after: bool = False):

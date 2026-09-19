@@ -27,6 +27,7 @@ Cloud-first PostgreSQL backup and restore system with automated daily backups, G
 - **☁️ Cloud-First Architecture**: All backups stored in Google Drive (S3 ready)
 - **🗄️ Multiple Databases**: Each database backed up to separate SQL files
 - **🔒 Safety Backups**: Automatic safety dump before restore operations
+- **🔐 Per-Project Isolation**: Every project gets its own role and database; apps reach Postgres only through PgBouncer
 - **🧹 Auto Cleanup**: 15-day retention policy on cloud storage
 - **📅 Hierarchical Storage**: Year/Month/Day folder structure
 - **♻️ Smart Archiving**: Multiple same-day backups archived in `olds/HH_MM/` subfolders
@@ -38,42 +39,34 @@ Cloud-first PostgreSQL backup and restore system with automated daily backups, G
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Docker Compose Stack                     │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
-│  │   Postgres   │  │   pgAdmin    │  │   pgBackup   │    │
-│  │   (Port 5432)│◄─┤  (Port 9090) │  │   (Cron)     │    │
-│  │              │  │              │  │              │    │
-│  └──────┬───────┘  └──────────────┘  └──────┬───────┘    │
-│         │                                     │            │
-│         │                                     │            │
-└─────────┼─────────────────────────────────────┼────────────┘
-          │                                     │
-          │                                     │
-    ┌─────▼──────┐                        ┌────▼─────┐
-    │   Volume   │                        │  Rclone  │
-    │ postgres_  │                        │  Config  │
-    │   data     │                        └────┬─────┘
-    └────────────┘                             │
-                                               │
-                                         ┌─────▼──────┐
-                                         │   Google   │
-                                         │   Drive    │
-                                         │            │
-                                         │  records/  │
-                                         │  manual_   │
-                                         │  backups/  │
-                                         └────────────┘
+Applications ── shared-db-net (external) ──┐
+host: shared-pgbouncer:5432                │
+                                           ▼
+                                    ┌──────────────┐
+                                    │  PgBouncer   │ SCRAM + auth_query
+                                    └──────┬───────┘
+                                           │ 10.250.0.10
+┌─ shared-db-internal (internal) ──────────┼───────────────┐
+│                                   ┌──────▼───────┐       │
+│  ┌──────────────┐  postgres /     │   Postgres   │       │
+│  │   pgBackup   ├─── backup ─────►│  (shared-db) │       │
+│  │ cron + admin │                 └──────┬───────┘       │
+│  └──────┬───────┘                        │               │
+└─────────┼────────────────────────────────┼───────────────┘
+          ▼                                ▼
+  rclone → Google Drive          postgres_data volume
 ```
+
+- `shared-db-net` is the only network applications join. It holds PgBouncer (and Redis), never Postgres.
+- `shared-db-internal` (`internal: true`, `10.250.0.0/24`) holds Postgres, PgBouncer (`10.250.0.10`) and pgBackup. pgBackup also joins the compose `default` network for rclone's internet access.
+- `pg_hba.conf` accepts only `sameuser` project logins from PgBouncer's address and rejects `postgres`/`backup` there; `postgres` and `backup` may connect only from the rest of the internal network.
 
 ### Backup Flow
 
 ```
 1. Cron triggers backup.py (02:00 AM daily)
 2. Create temp directory
-3. Dump each database → /tmp/backup_TIMESTAMP/
+3. Dump each database as the read-only `backup` role → /tmp/backup_TIMESTAMP/
 4. Generate SHA256 checksums
 5. Check if backup already exists for today
    - If exists: Move to records/YYYY/MM/DD/olds/HH_MM/
@@ -89,7 +82,7 @@ Cloud-first PostgreSQL backup and restore system with automated daily backups, G
 2. List cloud backups, find latest with target DB
 3. Download to temp → /tmp/restore_TIMESTAMP/
 4. Safety backup current DB → manual_backups/YYYY/MM/DD/
-5. Drop and recreate database
+5. Drop and recreate database (owned by the project role, ICU tr-TR, CONNECT only for the project and `backup`)
 6. Restore from SQL file (quiet mode)
 7. Verify tables
 8. Clean temp directory
@@ -130,6 +123,10 @@ POSTGRES_USER=postgres
 POSTGRES_PASSWORD=your_secure_password
 POSTGRES_HOST=shared-db  # Docker service name (DO NOT CHANGE)
 POSTGRES_PORT=5432
+BACKUP_PASSWORD=backup_secure_password
+PGBOUNCER_AUTH_PASSWORD=pgbouncer_auth_secure_password
+PGBOUNCER_ADMIN_PASSWORD=
+PGBOUNCER_STATS_PASSWORD=
 
 # pgAdmin Configuration
 PGADMIN_EMAIL=admin@example.com
@@ -185,21 +182,28 @@ docker-compose ps
 
 | Service | Port | Description |
 |---------|------|-------------|
-| `db` | 5432 (localhost only) | PostgreSQL 17 database |
+| `db` | - (internal network only) | PostgreSQL 18 + pgvector, `pg_hba.conf` mounted from the repo |
+| `pgbouncer` | - (never published to the host) | Connection pooler, the only entry point for applications |
 | `pgadmin` | 9090 (localhost only) | Web-based DB management UI |
-| `pgbackup` | - | Backup/restore automation container |
+| `pgbackup` | - | Backup/restore automation and admin scripts; runs `bootstrap.py` on start |
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `POSTGRES_DB` | `shared_db` | Default database name |
-| `POSTGRES_USER` | `postgres` | Database superuser |
+| `POSTGRES_USER` | `postgres` | Database superuser; keep it `postgres`, `pg_hba.conf` refers to it |
 | `POSTGRES_PASSWORD` | - | **Required**: Database password |
 | `POSTGRES_HOST` | `shared-db` | Docker service name (hardcoded in scripts) |
 | `POSTGRES_PORT` | `5432` | Database port |
+| `BACKUP_PASSWORD` | - | **Required**: Password of the `backup` role (`pg_read_all_data` + `BYPASSRLS`) used for dumps |
+| `PGBOUNCER_AUTH_PASSWORD` | - | **Required**: Password of the `pgbouncer_auth` role that runs PgBouncer's `auth_query` |
+| `PGBOUNCER_ADMIN_PASSWORD` | - | Enables the `pgbouncer_admin` console user; empty disables its login |
+| `PGBOUNCER_STATS_PASSWORD` | - | Enables the `pgbouncer_stats` console user; empty disables its login |
 | `BACKUP_RETENTION_DAYS` | `15` | Days to keep backups in cloud |
 | `RCLONE_REMOTE` | `grdive:` | rclone remote name |
+
+`pgbackup` runs `bootstrap.py` every time it starts. It creates or updates the `backup`, `pgbouncer_auth`, `pgbouncer_admin` and `pgbouncer_stats` roles from these passwords and installs `pgbouncer.user_lookup()`, the `SECURITY DEFINER` function behind PgBouncer's `auth_query` (it never returns superusers or `BYPASSRLS`/replication roles).
 
 ---
 
@@ -208,12 +212,24 @@ docker-compose ps
 ### Create New Database
 
 ```bash
-# Interactive mode
-docker-compose exec pgbackup python /app/mkdb.py
-
-# Non-interactive mode
 docker-compose exec pgbackup python /app/mkdb.py my_django_db
+docker-compose exec pgbackup python /app/mkdb.py my_ai_app --extension vector
 ```
+
+- Creates a role and a database with the same name. Names must match `^[a-z][a-z0-9_]*$` (max 63 characters); `postgres`, `backup`, `pgbouncer*`, `pg_*` and other reserved names are refused.
+- The role is `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE` with a random password stored as SCRAM-SHA-256.
+- The database is owned by that role, uses ICU `tr-TR` from `template0`, and only the role itself and `backup` have `CONNECT`.
+- `--extension NAME` (repeatable) installs the extension as superuser inside the new database.
+- The output contains only the project's connection info (`shared-pgbouncer:5432`). The password is shown once and cannot be retrieved later.
+
+### Delete Database
+
+```bash
+docker-compose exec pgbackup python /app/rmdb.py my_django_db
+docker-compose exec pgbackup python /app/rmdb.py my_django_db --yes
+```
+
+Drops the database (terminating its connections) and the role with the same name. Without `--yes` it asks you to type the name.
 
 ### Manual Backup
 
@@ -237,6 +253,31 @@ docker-compose exec pgbackup python /app/restore.py my_django_db 2025/10/7
 
 # Skip safety backup (not recommended)
 docker-compose exec pgbackup python /app/restore.py my_django_db --skip-safety-backup
+```
+
+### Per-Project Connection Limits
+
+Global defaults in `pgbouncer.ini` are `max_user_connections = 20` and `max_db_connections = 20`. Override a project under `[users]`:
+
+```ini
+[users]
+my_django_db = max_user_connections=10
+```
+
+Reload without dropping clients:
+
+```bash
+docker-compose kill -s HUP pgbouncer
+```
+
+If the change is not picked up (some editors replace the file, and a single-file bind mount keeps pointing at the old one), run `docker-compose restart pgbouncer`. Keep the sum of project limits below Postgres `max_connections` (100 by default).
+
+### PgBouncer Console
+
+`admin_users` and `stats_users` are the non-superuser roles `pgbouncer_admin` and `pgbouncer_stats`, enabled by their passwords in `.env`:
+
+```bash
+docker-compose exec pgbouncer psql -h 127.0.0.1 -U pgbouncer_stats pgbouncer -c "SHOW POOLS"
 ```
 
 ### Access pgAdmin
@@ -275,6 +316,8 @@ docker-compose exec pgbackup pgrep crond
 ```
 shared-db/
 ├── docker-compose.yml          # Orchestration configuration
+├── pgbouncer.ini               # PgBouncer pooling, auth_query and per-project limits
+├── pg_hba.conf                 # Postgres client authentication rules
 ├── .env                        # Environment variables (NEVER commit!)
 ├── .gitignore                  # Git ignore rules
 ├── README.md                   # This file
@@ -286,8 +329,10 @@ shared-db/
     ├── Dockerfile              # Backup container image
     ├── requirements.txt        # Python dependencies
     ├── backup.py               # Automated daily backup script
+    ├── bootstrap.py            # Service roles and PgBouncer auth function
     ├── restore.py              # Database restore script
-    └── mkdb.py                 # Quick database creation utility
+    ├── mkdb.py                 # Isolated project role + database creation
+    └── rmdb.py                 # Project database + role removal
 ```
 
 ### Cloud Storage Structure
@@ -416,7 +461,7 @@ services:
     depends_on:
       - db
     environment:
-      DATABASE_URL: postgresql://postgres:password@shared-db:5432/my_django_db
+      DATABASE_URL: postgresql://my_django_db:<password from mkdb>@shared-pgbouncer:5432/my_django_db
     networks:
       - shared-db-net
 
@@ -425,6 +470,8 @@ networks:
     external: true
     name: shared-db-net
 ```
+
+Postgres is not on `shared-db-net`; always connect through `shared-pgbouncer` with the project's own role. PgBouncer runs in transaction mode, so set `"DISABLE_SERVER_SIDE_CURSORS": True` in the Django `DATABASES` entry.
 
 ### Migrate to S3
 
@@ -554,7 +601,8 @@ docker-compose exec pgbackup rclone config
 - ✅ Use strong passwords for `POSTGRES_PASSWORD` and `PGADMIN_PASSWORD`
 - ✅ Keep OAuth tokens secure in `rclone.conf`
 - ✅ Limit Google Drive access using `root_folder_id`
-- ✅ Use localhost binding for exposed ports (already configured)
+- ✅ No host ports: Postgres and PgBouncer are reachable only from Docker networks
+- ✅ Give each application only its own project role, never `POSTGRES_PASSWORD`
 - ✅ Regularly rotate database passwords
 - ✅ Monitor cloud storage quotas
 

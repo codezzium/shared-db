@@ -9,15 +9,17 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    command: ["postgres", "-c", "hba_file=/etc/postgresql/pg_hba.conf"]
     volumes:
       - postgres_data:/var/lib/postgresql
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d postgres -h localhost -p 5432" ]
       interval: 10s
       timeout: 5s
       retries: 10
     networks:
-      - shared-db-net
+      - shared-db-internal
     logging:
       driver: "json-file"
       options:
@@ -28,12 +30,9 @@ services:
     image: edoburu/pgbouncer:latest
     container_name: shared-pgbouncer
     restart: unless-stopped
-    env_file: .env
     environment:
-      DB_USER: ${POSTGRES_USER}
-      DB_PASSWORD: ${POSTGRES_PASSWORD}
-      DB_HOST: db
-      DB_NAME: "*"
+      DB_USER: pgbouncer_auth
+      DB_PASSWORD: ${PGBOUNCER_AUTH_PASSWORD:?PGBOUNCER_AUTH_PASSWORD is required}
       AUTH_TYPE: scram-sha-256
     # Pool sizes and per-user budgets are maintained in pgbouncer.ini.
     volumes:
@@ -41,10 +40,10 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    ports:
-      - "${SERVER_URL-127.0.0.1:5432}:5432"
     networks:
-      - shared-db-net
+      shared-db-internal:
+        ipv4_address: 10.250.0.10
+      shared-db-net:
     logging:
       driver: "json-file"
       options:
@@ -76,6 +75,9 @@ services:
     container_name: shared-pgbackup
     restart: unless-stopped
     env_file: .env
+    environment:
+      BACKUP_PASSWORD: ${BACKUP_PASSWORD:?BACKUP_PASSWORD is required}
+      PGBOUNCER_AUTH_PASSWORD: ${PGBOUNCER_AUTH_PASSWORD:?PGBOUNCER_AUTH_PASSWORD is required}
     depends_on:
       db:
         condition: service_healthy
@@ -88,7 +90,8 @@ services:
       timeout: 10s
       retries: 3
     networks:
-      - shared-db-net
+      - shared-db-internal
+      - default
     logging:
       driver: "json-file"
       options:
@@ -103,3 +106,11 @@ networks:
   shared-db-net:
     name: shared-db-net
     driver: bridge
+  shared-db-internal:
+    name: shared-db-internal
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.250.0.0/24
+          ip_range: 10.250.0.128/25

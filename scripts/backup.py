@@ -12,8 +12,9 @@ import json
 
 PGHOST = os.getenv("POSTGRES_HOST")
 PGPORT = os.getenv("POSTGRES_PORT")
-PGUSER = os.getenv("POSTGRES_USER")
-PGPASSWORD = os.getenv("POSTGRES_PASSWORD")
+BACKUP_ROLE = "backup"
+PGUSER = BACKUP_ROLE
+PGPASSWORD = os.getenv("BACKUP_PASSWORD")
 RETENTION_DAYS = int(os.getenv("BACKUP_RETENTION_DAYS", "15"))
 RCLONE_REMOTE = os.getenv("RCLONE_REMOTE", "grdive:")
 SERVER_NAME = os.getenv("SERVER_NAME", "default")
@@ -38,7 +39,7 @@ def list_databases():
     env["PGPASSWORD"] = PGPASSWORD
     sql = "SELECT datname FROM pg_database WHERE datistemplate=false AND datname<>'postgres';"
     res = run(
-        ["psql", "-h", PGHOST, "-p", PGPORT, "-U", PGUSER, "-tA", "-c", sql],
+        ["psql", "-h", PGHOST, "-p", PGPORT, "-U", PGUSER, "-d", "postgres", "-tA", "-c", sql],
         env=env,
         capture=True,
     )
