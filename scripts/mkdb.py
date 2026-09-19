@@ -4,8 +4,6 @@ Quick database creator for new projects.
 Usage: docker exec -it shared-pgbackup python /app/mkdb.py <database name>
 """
 import argparse
-import os
-import re
 import secrets
 import sys
 
@@ -13,71 +11,82 @@ import psycopg2
 from psycopg2 import sql
 from psycopg2.extensions import encrypt_password
 
-from backup import BACKUP_ROLE
+import metadb
+from common import APP_HOST, APP_PORT, BACKUP_ROLE, connect, db_exists, role_exists, validate_name
 
-PGHOST = os.getenv("POSTGRES_HOST")
-PGPORT = os.getenv("POSTGRES_PORT")
-PGUSER = os.getenv("POSTGRES_USER")
-PGPASSWORD = os.getenv("POSTGRES_PASSWORD")
-
-APP_HOST = "shared-pgbouncer"
-APP_PORT = "5432"
-
-PGBOUNCER_AUTH_ROLE = "pgbouncer_auth"
-PGBOUNCER_ADMIN_ROLE = "pgbouncer_admin"
-PGBOUNCER_STATS_ROLE = "pgbouncer_stats"
-
-NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,62}")
-RESERVED_NAMES = {
-    "postgres",
-    "template0",
-    "template1",
-    "pgbouncer",
-    "public",
-    "none",
-    "current_user",
-    "current_role",
-    "session_user",
-    BACKUP_ROLE,
-    PGBOUNCER_AUTH_ROLE,
-    PGBOUNCER_ADMIN_ROLE,
-    PGBOUNCER_STATS_ROLE,
-}
+OWNERSHIP_QUERY = """
+WITH owner AS (SELECT %(owner)s::regrole::oid AS oid),
+members AS (SELECT classid, objid FROM pg_depend WHERE deptype = 'e')
+SELECT 1, format('ALTER SCHEMA %%I OWNER TO %%I', n.nspname, %(owner)s)
+FROM pg_namespace n, owner
+WHERE n.nspname !~ '^pg_'
+  AND n.nspname <> 'information_schema'
+  AND n.nspowner NOT IN (owner.oid, 'pg_database_owner'::regrole)
+  AND ('pg_namespace'::regclass, n.oid) NOT IN (SELECT classid, objid FROM members)
+UNION ALL
+SELECT 2, format(
+    'ALTER %%s %%s OWNER TO %%I',
+    CASE c.relkind
+        WHEN 'v' THEN 'VIEW'
+        WHEN 'm' THEN 'MATERIALIZED VIEW'
+        WHEN 'f' THEN 'FOREIGN TABLE'
+        WHEN 'S' THEN 'SEQUENCE'
+        ELSE 'TABLE'
+    END,
+    c.oid::regclass,
+    %(owner)s
+)
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace, owner
+WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+  AND n.nspname !~ '^pg_'
+  AND n.nspname <> 'information_schema'
+  AND c.relowner <> owner.oid
+  AND ('pg_class'::regclass, c.oid) NOT IN (SELECT classid, objid FROM members)
+  AND NOT (
+      c.relkind = 'S'
+      AND EXISTS (
+          SELECT 1
+          FROM pg_depend d
+          WHERE d.classid = 'pg_class'::regclass
+            AND d.objid = c.oid
+            AND d.refclassid = 'pg_class'::regclass
+            AND d.deptype IN ('a', 'i')
+      )
+  )
+UNION ALL
+SELECT 3, format('ALTER ROUTINE %%s OWNER TO %%I', p.oid::regprocedure, %(owner)s)
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace, owner
+WHERE n.nspname !~ '^pg_'
+  AND n.nspname <> 'information_schema'
+  AND p.proowner <> owner.oid
+  AND ('pg_proc'::regclass, p.oid) NOT IN (SELECT classid, objid FROM members)
+UNION ALL
+SELECT 4, format(
+    'ALTER %%s %%s OWNER TO %%I',
+    CASE t.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END,
+    t.oid::regtype,
+    %(owner)s
+)
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace, owner
+WHERE t.typtype IN ('c', 'd', 'e', 'r')
+  AND (t.typtype <> 'c' OR EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = t.typrelid AND c.relkind = 'c'))
+  AND n.nspname !~ '^pg_'
+  AND n.nspname <> 'information_schema'
+  AND t.typowner <> owner.oid
+  AND ('pg_type'::regclass, t.oid) NOT IN (SELECT classid, objid FROM members)
+UNION ALL
+SELECT 5, format('ALTER LARGE OBJECT %%s OWNER TO %%I', l.oid, %(owner)s)
+FROM pg_largeobject_metadata l, owner
+WHERE l.lomowner <> owner.oid
+ORDER BY 1
+"""
 
 
 class ProjectError(Exception):
     pass
-
-
-def connect(dbname: str = "postgres"):
-    conn = psycopg2.connect(
-        host=PGHOST,
-        port=PGPORT,
-        user=PGUSER,
-        password=PGPASSWORD,
-        dbname=dbname,
-    )
-    conn.autocommit = True
-    return conn
-
-
-def validate_name(name: str) -> str | None:
-    if not NAME_PATTERN.fullmatch(name):
-        return "Use only lowercase letters, digits and underscores, starting with a letter (max 63 characters)"
-    if name in RESERVED_NAMES or name.startswith("pg_"):
-        return f"'{name}' is reserved"
-    return None
-
-
-def role_exists(cur, name: str) -> bool:
-    cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (name,))
-    return cur.fetchone() is not None
-
-
-def db_exists(cur, dbname: str) -> bool:
-    """Check if database already exists"""
-    cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (dbname,))
-    return cur.fetchone() is not None
 
 
 def unavailable_extensions(cur, extensions: list[str]) -> list[str]:
@@ -125,6 +134,51 @@ def install_extensions(dbname: str, extensions: list[str]):
         conn.close()
 
 
+def reassign_ownership(dbname: str, owner: str) -> int:
+    conn = connect(dbname)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(OWNERSHIP_QUERY, {"owner": owner})
+            statements = [row[1] for row in cur.fetchall()]
+            for statement in statements:
+                cur.execute(statement)
+    finally:
+        conn.close()
+    if statements:
+        print(f"[OWNER] {len(statements)} object(s) in {dbname} now owned by {owner}")
+    return len(statements)
+
+
+def retarget_policies(cur, old_role: str, new_role: str):
+    cur.execute("SELECT %s::regrole::oid", (old_role,))
+    old_oid = cur.fetchone()[0]
+    cur.execute(
+        """
+        SELECT p.polname, p.polrelid::regclass::text,
+               array(SELECT CASE WHEN r = 0 THEN NULL ELSE pg_get_userbyid(r) END FROM unnest(p.polroles) AS r),
+               array(SELECT r FROM unnest(p.polroles) AS r)
+        FROM pg_policy p
+        WHERE %s = ANY(p.polroles)
+        """,
+        (old_oid,),
+    )
+    for name, table, role_names, role_oids in cur.fetchall():
+        targets = []
+        for role, oid in zip(role_names, role_oids):
+            if role is None:
+                target = sql.SQL("PUBLIC")
+            else:
+                target = sql.Identifier(new_role if oid == old_oid else role)
+            if target not in targets:
+                targets.append(target)
+        cur.execute(
+            sql.SQL("ALTER POLICY {} ON {} TO {}").format(
+                sql.Identifier(name), sql.SQL(table), sql.SQL(", ").join(targets)
+            )
+        )
+        print(f"[POLICY] {table}.{name}: role {old_role} replaced by {new_role}")
+
+
 def drop_project(cur, name: str):
     if db_exists(cur, name):
         print(f"[DROP] Database: {name}")
@@ -136,8 +190,9 @@ def drop_project(cur, name: str):
 
 def create_project(name: str, extensions: list[str]) -> str:
     conn = connect()
+    meta = metadb.connect_meta()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor() as cur, meta.cursor() as meta_cur:
             if role_exists(cur, name):
                 raise ProjectError(f"Role '{name}' already exists")
             if db_exists(cur, name):
@@ -145,6 +200,7 @@ def create_project(name: str, extensions: list[str]) -> str:
             missing = unavailable_extensions(cur, extensions)
             if missing:
                 raise ProjectError(f"Extension not available: {', '.join(missing)}")
+            metadb.validate_default_targets(meta_cur)
 
             print(f"[CREATE] Role: {name}")
             password = create_role(cur, name)
@@ -153,12 +209,16 @@ def create_project(name: str, extensions: list[str]) -> str:
                 print(f"[CREATE] Database: {name}")
                 create_database(cur, name, name)
                 install_extensions(name, extensions)
+                targets = metadb.add_default_policies(meta_cur, name)
+                print(f"[POLICY] Backup targets: {', '.join(targets)}")
                 completed = True
             finally:
                 if not completed:
                     print(f"[ROLLBACK] Removing partially created project: {name}")
+                    metadb.delete_policies(meta_cur, name)
                     drop_project(cur, name)
     finally:
+        meta.close()
         conn.close()
     return password
 
@@ -208,7 +268,7 @@ def main():
 
     try:
         password = create_project(dbname, args.extension)
-    except (ProjectError, psycopg2.Error) as e:
+    except (ProjectError, metadb.MetaError, psycopg2.Error) as e:
         print(f"[ERROR] Failed to create database: {str(e).strip()}")
         sys.exit(1)
 

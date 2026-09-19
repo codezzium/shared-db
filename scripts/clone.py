@@ -8,6 +8,12 @@ import sys
 import os
 import subprocess
 
+import psycopg2
+
+import metadb
+from common import connect, role_exists, validate_name
+from mkdb import ProjectError, create_project, print_connection_info, reassign_ownership, retarget_policies
+
 PGHOST = os.getenv("POSTGRES_HOST")
 PGPORT = os.getenv("POSTGRES_PORT")
 PGUSER = os.getenv("POSTGRES_USER")
@@ -46,13 +52,10 @@ def db_exists(dbname: str) -> bool:
     return result.stdout.strip() == "1"
 
 
-def create_db(dbname: str):
+def create_db(dbname: str) -> str:
     """Create a new database with Turkish ICU collation settings"""
     print(f"[CREATE] Creating database: {dbname}")
-    run([
-        "psql", "-h", PGHOST, "-p", PGPORT, "-U", PGUSER, "-d", "postgres",
-        "-c", f"CREATE DATABASE {dbname} WITH LOCALE_PROVIDER=icu ICU_LOCALE='tr-TR' TEMPLATE=template0;"
-    ])
+    return create_project(dbname, [])
 
 
 def clone_db(source: str, target: str):
@@ -65,11 +68,11 @@ def clone_db(source: str, target: str):
 
     # Command: pg_dump source | psql target
     dump_cmd = ["pg_dump", "-h", PGHOST, "-p", PGPORT, "-U", PGUSER, source]
-    restore_cmd = ["psql", "-h", PGHOST, "-p", PGPORT, "-U", PGUSER, target]
+    restore_cmd = ["psql", "-h", PGHOST, "-p", PGPORT, "-U", PGUSER, "-X", "-q", "-v", "ON_ERROR_STOP=1", target]
 
     # We use subprocess.Popen to handle the pipe
     p1 = subprocess.Popen(dump_cmd, stdout=subprocess.PIPE, env=env)
-    p2 = subprocess.Popen(restore_cmd, stdin=p1.stdout, env=env)
+    p2 = subprocess.Popen(restore_cmd, stdin=p1.stdout, stdout=subprocess.DEVNULL, env=env)
     p1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits
 
     output = p2.communicate()[0]
@@ -83,6 +86,17 @@ def clone_db(source: str, target: str):
     print(f"[SUCCESS] Cloned {source} to {target}")
 
 
+def adopt_clone(source: str, target: str):
+    reassign_ownership(target, target)
+    conn = connect(target)
+    try:
+        with conn.cursor() as cur:
+            if role_exists(cur, source):
+                retarget_policies(cur, source, target)
+    finally:
+        conn.close()
+
+
 def main():
     if len(sys.argv) != 3:
         print("Usage: python clone.py <source_db> <target_db>")
@@ -90,6 +104,12 @@ def main():
 
     source_db = sys.argv[1]
     target_db = sys.argv[2]
+
+    error = validate_name(target_db)
+    if error:
+        print(f"[ERROR] Invalid target database name: {target_db}")
+        print(f"[ERROR] {error}")
+        sys.exit(1)
 
     # Check source exists
     if not db_exists(source_db):
@@ -103,17 +123,22 @@ def main():
 
     try:
         # Create target DB
-        create_db(target_db)
+        password = create_db(target_db)
 
         # Clone data
         clone_db(source_db, target_db)
+        adopt_clone(source_db, target_db)
 
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] Cloning failed: {e}")
+    except (subprocess.CalledProcessError, ProjectError, metadb.MetaError, psycopg2.Error) as e:
+        print(f"[ERROR] Cloning failed: {str(e).strip()}")
         # Cleanup: verify if we should drop the half-created DB?
         # For safety, we might leave it or delete it.
         # User requirement didn't specify cleanup on failure, keeping it simple.
+        if db_exists(target_db):
+            print(f"[HINT] Remove the partial clone with: python /app/rmdb.py {target_db} --yes")
         sys.exit(1)
+
+    print_connection_info(target_db, password)
 
 
 if __name__ == "__main__":

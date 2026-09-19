@@ -4,7 +4,9 @@ import sys
 
 import psycopg2
 
-from mkdb import connect, db_exists, drop_project, role_exists, validate_name
+import metadb
+from common import connect, db_exists, role_exists, validate_name
+from mkdb import drop_project
 
 
 def confirm(dbname: str) -> bool:
@@ -13,6 +15,21 @@ def confirm(dbname: str) -> bool:
         return False
     answer = input(f"Type '{dbname}' to permanently delete its database and role: ")
     return answer.strip() == dbname
+
+
+def remove_policies(dbname: str):
+    try:
+        meta = metadb.connect_meta()
+        try:
+            with meta.cursor() as cur:
+                removed = metadb.delete_policies(cur, dbname)
+        finally:
+            meta.close()
+    except psycopg2.Error as e:
+        print(f"[WARN] Could not remove backup policies of '{dbname}': {str(e).strip()}")
+        return
+    if removed:
+        print(f"[POLICY] Removed {removed} backup polic{'y' if removed == 1 else 'ies'} of {dbname}")
 
 
 def main():
@@ -37,6 +54,7 @@ def main():
             with conn.cursor() as cur:
                 if not db_exists(cur, dbname) and not role_exists(cur, dbname):
                     print(f"[ERROR] Neither database nor role '{dbname}' exists")
+                    remove_policies(dbname)
                     sys.exit(1)
                 if not args.yes and not confirm(dbname):
                     print("[CANCEL] Nothing was deleted")
@@ -48,6 +66,7 @@ def main():
         print(f"[ERROR] Failed to delete: {str(e).strip()}")
         sys.exit(1)
 
+    remove_policies(dbname)
     print(f"[OK] '{dbname}' deleted")
 
 

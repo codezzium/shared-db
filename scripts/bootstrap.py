@@ -6,8 +6,19 @@ import psycopg2
 from psycopg2 import sql
 from psycopg2.extensions import encrypt_password
 
-from backup import BACKUP_ROLE
-from mkdb import PGBOUNCER_ADMIN_ROLE, PGBOUNCER_AUTH_ROLE, PGBOUNCER_STATS_ROLE, connect, role_exists
+import metadb
+from common import (
+    BACKUP_ROLE,
+    META_DB,
+    PGBOUNCER_ADMIN_ROLE,
+    PGBOUNCER_AUTH_ROLE,
+    PGBOUNCER_STATS_ROLE,
+    PGUSER,
+    connect,
+    db_exists,
+    role_exists,
+)
+from mkdb import create_database
 
 UNPRIVILEGED = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
 BACKUP_ATTRIBUTES = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION BYPASSRLS"
@@ -59,6 +70,34 @@ def ensure_auth_function(cur):
     print("[OK] Auth function: pgbouncer.user_lookup")
 
 
+def ensure_meta_database():
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            if not db_exists(cur, META_DB):
+                create_database(cur, META_DB, PGUSER)
+                print(f"[OK] Database created: {META_DB}")
+            cur.execute(
+                sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                    sql.Identifier(META_DB), sql.Identifier(BACKUP_ROLE)
+                )
+            )
+    finally:
+        conn.close()
+
+    conn = metadb.connect_meta()
+    conn.autocommit = False
+    try:
+        with conn, conn.cursor() as cur:
+            metadb.ensure_schema(cur)
+            seeded = metadb.seed_targets(cur)
+    finally:
+        conn.close()
+    print(f"[OK] Backup metadata schema: {META_DB}")
+    if seeded:
+        print(f"[OK] Default backup target seeded: {seeded.name} -> {seeded.location()}")
+
+
 def main():
     backup_password = os.getenv("BACKUP_PASSWORD")
     auth_password = os.getenv("PGBOUNCER_AUTH_PASSWORD")
@@ -84,6 +123,7 @@ def main():
                 ensure_auth_function(cur)
         finally:
             conn.close()
+        ensure_meta_database()
     except psycopg2.Error as e:
         print(f"[ERROR] Bootstrap failed: {str(e).strip()}")
         sys.exit(1)

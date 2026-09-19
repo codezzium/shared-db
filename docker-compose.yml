@@ -26,6 +26,28 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  db-init:
+    build: ./scripts
+    container_name: shared-db-init
+    restart: "no"
+    env_file: .env
+    environment:
+      BACKUP_PASSWORD: ${BACKUP_PASSWORD:?BACKUP_PASSWORD is required}
+      PGBOUNCER_AUTH_PASSWORD: ${PGBOUNCER_AUTH_PASSWORD:?PGBOUNCER_AUTH_PASSWORD is required}
+    command: ["python", "/app/bootstrap.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/app
+    networks:
+      - shared-db-internal
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
   pgbouncer:
     image: edoburu/pgbouncer:latest
     container_name: shared-pgbouncer
@@ -37,9 +59,12 @@ services:
     # Pool sizes and per-user budgets are maintained in pgbouncer.ini.
     volumes:
       - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer_hba.conf:/etc/pgbouncer/pgbouncer_hba.conf:ro
     depends_on:
       db:
         condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     networks:
       shared-db-internal:
         ipv4_address: 10.250.0.10
@@ -70,6 +95,80 @@ services:
   #   logging:
   #     driver: "none"
 
+  redis:
+    image: redis:8.8.2-alpine
+    container_name: shared-redis
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/usr/local/etc/redis/entrypoint.sh"]
+    environment:
+      REDIS_ADMIN_PASSWORD: ${REDIS_ADMIN_PASSWORD:?REDIS_ADMIN_PASSWORD is required}
+      REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-512mb}
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./redis/entrypoint.sh:/usr/local/etc/redis/entrypoint.sh:ro
+      - ./redis/acl:/etc/redis/acl
+      - redis_data:/data
+      - redis_socket:/run/redis
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_ADMIN_PASSWORD\" redis-cli --user admin -s /run/redis/redis.sock ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - shared-db-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  garage:
+    image: dxflrs/garage:v2.3.0
+    container_name: shared-garage
+    restart: unless-stopped
+    profiles: ["garage"]
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-}
+    volumes:
+      - ./garage/garage.toml:/etc/garage.toml:ro
+      - garage_meta:/var/lib/garage/meta
+      - ${GARAGE_DATA_DIR:-garage_data}:/var/lib/garage/data
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - shared-db-internal
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  garage-init:
+    build: ./scripts
+    container_name: shared-garage-init
+    restart: "no"
+    profiles: ["garage"]
+    env_file: .env
+    command: ["python", "/app/garage_init.py"]
+    depends_on:
+      garage:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./scripts:/app
+    networks:
+      - shared-db-internal
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
   pgbackup:
     build: ./scripts
     container_name: shared-pgbackup
@@ -77,13 +176,16 @@ services:
     env_file: .env
     environment:
       BACKUP_PASSWORD: ${BACKUP_PASSWORD:?BACKUP_PASSWORD is required}
-      PGBOUNCER_AUTH_PASSWORD: ${PGBOUNCER_AUTH_PASSWORD:?PGBOUNCER_AUTH_PASSWORD is required}
+      SERVER_NAME: ${SERVER_NAME:?SERVER_NAME is required}
     depends_on:
       db:
         condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     volumes:
       - ./rclone:/root/.config/rclone
       - ./scripts:/app
+      - redis_socket:/run/redis
     healthcheck:
       test: ["CMD-SHELL", "pgrep crond || exit 1"]
       interval: 1m
@@ -101,6 +203,10 @@ services:
 volumes:
   postgres_data:
   pgadmin_data:
+  redis_data:
+  redis_socket:
+  garage_meta:
+  garage_data:
 
 networks:
   shared-db-net:

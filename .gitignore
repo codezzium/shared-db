@@ -10,6 +10,8 @@ backups/
 rclone/rclone.conf
 rclone/*.conf
 
+redis/acl/
+
 # Docker volumes
 postgres_data/
 pgadmin_data/
