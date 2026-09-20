@@ -1,5 +1,7 @@
+import hashlib
 import os
 import re
+from zoneinfo import ZoneInfo
 
 import psycopg2
 
@@ -7,6 +9,7 @@ PGHOST = os.getenv("POSTGRES_HOST")
 PGPORT = os.getenv("POSTGRES_PORT")
 PGUSER = os.getenv("POSTGRES_USER")
 PGPASSWORD = os.getenv("POSTGRES_PASSWORD")
+POSTGRES_DB = os.getenv("POSTGRES_DB") or PGUSER
 
 BACKUP_ROLE = "backup"
 BACKUP_PASSWORD = os.getenv("BACKUP_PASSWORD")
@@ -18,6 +21,11 @@ SERVICE_ROLES = (BACKUP_ROLE, PGBOUNCER_AUTH_ROLE, PGBOUNCER_ADMIN_ROLE, PGBOUNC
 
 META_DB = "backup_meta"
 SERVER_NAME = os.getenv("SERVER_NAME", "default")
+TIMEZONE = ZoneInfo("Europe/Istanbul")
+
+STAGING_PREFIX = "_restore_"
+REPLACED_PREFIX = "_replaced_"
+TRANSIENT_PREFIXES = (STAGING_PREFIX, REPLACED_PREFIX)
 
 APP_HOST = "shared-pgbouncer"
 APP_PORT = "5432"
@@ -44,6 +52,17 @@ def validate_name(name: str) -> str | None:
     if name in RESERVED_NAMES or name.startswith("pg_"):
         return f"'{name}' is reserved"
     return None
+
+
+def transient_name(prefix: str, dbname: str) -> str:
+    name = f"{prefix}{dbname}"
+    if len(name) <= 63:
+        return name
+    return f"{name[:54]}_{hashlib.sha256(dbname.encode()).hexdigest()[:8]}"
+
+
+def local_time(value) -> str:
+    return f"{value.astimezone(TIMEZONE):%Y-%m-%d %H:%M}"
 
 
 def connect(dbname: str = "postgres", user: str | None = None, password: str | None = None):

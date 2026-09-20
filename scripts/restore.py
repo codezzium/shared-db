@@ -32,7 +32,19 @@ from backup import (
     now_utc,
     upload_file,
 )
-from common import META_DB, SERVICE_ROLES, connect, role_exists, validate_name
+from common import (
+    META_DB,
+    POSTGRES_DB,
+    REPLACED_PREFIX,
+    SERVICE_ROLES,
+    STAGING_PREFIX,
+    connect,
+    local_time,
+    role_exists,
+    transient_name,
+    validate_name,
+)
+from common import db_exists as database_exists
 from mkdb import create_database, create_role, print_connection_info, reassign_ownership, retarget_policies
 
 PGHOST = os.getenv("POSTGRES_HOST")
@@ -40,6 +52,7 @@ PGPORT = os.getenv("POSTGRES_PORT")
 PGUSER = os.getenv("POSTGRES_USER")
 PGPASSWORD = os.getenv("POSTGRES_PASSWORD")
 SERVER_NAME = os.getenv("SERVER_NAME", "default")
+SYSTEM_DATABASES = (META_DB, POSTGRES_DB)
 
 ROLE_KEYWORDS = {"public", "current_user", "current_role", "session_user"}
 ROLE_REFERENCE_PATTERNS = (
@@ -53,6 +66,35 @@ ROLE_REFERENCE_PATTERNS = (
 
 class RestoreError(Exception):
     pass
+
+
+class TargetUnreachable(RestoreError):
+    pass
+
+
+LIST_FLAGS = ("--contimeout", "10s", "--timeout", "1m", "--low-level-retries", "3")
+UNREACHABLE: dict[str, str] = {}
+
+
+def mark_unreachable(target: metadb.Target, error: str):
+    if target.name in UNREACHABLE:
+        return
+    UNREACHABLE[target.name] = error
+    print(f"[WARN] Target {target.name} is unreachable and skipped: {error}")
+
+
+def scan(target: metadb.Target, action):
+    if target.name in UNREACHABLE:
+        return None
+    try:
+        return action(target)
+    except TargetUnreachable as e:
+        mark_unreachable(target, str(e))
+        return None
+
+
+def unreachable_report() -> str:
+    return "; ".join(f"{name}: {error}" for name, error in UNREACHABLE.items())
 
 
 def run(cmd, check=True, capture=False, cwd=None, quiet=False):
@@ -75,12 +117,12 @@ def run(cmd, check=True, capture=False, cwd=None, quiet=False):
 
 
 def rclone_list(args: list[str]) -> list[str] | None:
-    result = subprocess.run(["rclone", "lsf", *args], capture_output=True, text=True)
+    result = subprocess.run(["rclone", "lsf", *LIST_FLAGS, *args], capture_output=True, text=True)
     if result.returncode == 3:
         return None
     if result.returncode != 0:
         lines = result.stderr.strip().splitlines()
-        raise RestoreError(f"rclone lsf {args[0]} failed: {lines[-1] if lines else result.returncode}")
+        raise TargetUnreachable(f"rclone lsf {args[0]} failed: {lines[-1] if lines else result.returncode}")
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
@@ -229,16 +271,8 @@ def check_file_in_cloud(target: metadb.Target, date_folder: str, filename: str) 
     Check if a specific file exists in a cloud backup folder using rclone lsf.
     No download needed — just lists remote files.
     """
-    result = run(
-        ["rclone", "lsf", target.location("records", SERVER_NAME, date_folder), "--files-only"],
-        capture=True,
-        check=False,
-        quiet=True,
-    )
-    if result.returncode != 0:
-        return False
-    files = result.stdout.decode().strip().split("\n")
-    return filename in files
+    files = scan(target, lambda t: rclone_list([t.location("records", SERVER_NAME, date_folder), "--files-only"]))
+    return filename in (files or [])
 
 
 def guess_latest_cloud_backup_for_db(target: metadb.Target, db: str) -> str | None:
@@ -293,9 +327,12 @@ def safety_backup_before_restore(db: str, targets: list[metadb.Target], meta=Non
     if not db_exists(db):
         print(f"[INFO] Database '{db}' does not exist yet, skipping safety backup")
         return None
+    for target in targets:
+        scan(target, lambda t: rclone_list([t.location(), "--dirs-only", "--max-depth", "1"]))
+    targets = [target for target in targets if target.name not in UNREACHABLE]
     if not targets:
         raise RestoreError(
-            f"No backup target known for '{db}', cannot store a safety backup "
+            f"No reachable backup target for '{db}', cannot store a safety backup "
             "(pass --target or --skip-safety-backup)"
         )
 
@@ -340,6 +377,7 @@ def safety_backup_before_restore(db: str, targets: list[metadb.Target], meta=Non
                     print(f"[WARN] Could not record safety backup run: {str(e).strip()}")
             if error:
                 print(f"[ERROR] Safety backup upload to {target.name} failed: {error}")
+                UNREACHABLE.setdefault(target.name, f"safety backup upload failed: {error}")
                 continue
             stored.append(target.location(cloud_path, filename))
             print(f"[OK] Safety backup uploaded: {stored[-1]}")
@@ -356,19 +394,117 @@ def safety_backup_before_restore(db: str, targets: list[metadb.Target], meta=Non
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def drop_create_db(db: str):
-    """Drop and recreate database"""
-    print(f"[DROP] Dropping database: {db}")
-    run(["dropdb", "-h", PGHOST, "-p", PGPORT, "-U", PGUSER, "--force", db], check=False)
+def replaced_leftover_error(db: str, replaced: str) -> RestoreError:
+    return RestoreError(
+        f"Database {replaced} exists, left over from an interrupted restore of '{db}'; "
+        "check it and drop it before restoring again"
+    )
 
-    print(f"[CREATE] Creating fresh database: {db}")
+
+def create_staging_db(db: str) -> str:
+    """Drop and recreate database"""
+    staging = transient_name(STAGING_PREFIX, db)
+    replaced = transient_name(REPLACED_PREFIX, db)
     conn = connect()
     try:
         with conn.cursor() as cur:
-            owner = db if role_exists(cur, db) else PGUSER
-            create_database(cur, db, owner)
+            if database_exists(cur, replaced):
+                raise replaced_leftover_error(db, replaced)
+            if database_exists(cur, staging):
+                cur.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = %s", (staging,))
+                if cur.fetchone()[0]:
+                    raise RestoreError(f"Another restore of '{db}' is running ({staging} is in use)")
+                print(f"[DROP] Dropping leftover staging database: {staging}")
+                cur.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(staging)))
+
+            print(f"[CREATE] Creating staging database: {staging}")
+            owner = db if db not in SYSTEM_DATABASES and role_exists(cur, db) else PGUSER
+            create_database(cur, staging, owner)
     finally:
         conn.close()
+    return staging
+
+
+def drop_staging_db(db: str, staging: str):
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                if not database_exists(cur, staging):
+                    return
+                cur.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(staging)))
+                kept = database_exists(cur, db)
+        finally:
+            conn.close()
+    except psycopg2.Error as e:
+        print(f"[WARN] Could not drop staging database {staging}: {str(e).strip()}")
+        return
+    print(f"[ROLLBACK] Staging database {staging} dropped{f', {db} is unchanged' if kept else ''}")
+
+
+def rename_db(cur, old: str, new: str):
+    cur.execute(sql.SQL("ALTER DATABASE {} RENAME TO {}").format(sql.Identifier(old), sql.Identifier(new)))
+
+
+def allow_connections(cur, db: str, allowed: bool):
+    cur.execute(
+        sql.SQL("ALTER DATABASE {} WITH ALLOW_CONNECTIONS {}").format(
+            sql.Identifier(db), sql.SQL("true" if allowed else "false")
+        )
+    )
+
+
+def swap_database(db: str, staging: str):
+    replaced = transient_name(REPLACED_PREFIX, db)
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            if not database_exists(cur, db):
+                rename_db(cur, staging, db)
+                print(f"[CREATE] Restored copy is now database {db}")
+                return
+            if database_exists(cur, replaced):
+                raise replaced_leftover_error(db, replaced)
+
+            print(f"[SWAP] Replacing {db} with the restored copy")
+            allow_connections(cur, db, False)
+            try:
+                terminate_connections(db)
+                rename_db(cur, db, replaced)
+            except psycopg2.Error:
+                allow_connections(cur, db, True)
+                raise
+            try:
+                rename_db(cur, staging, db)
+            except psycopg2.Error:
+                rename_db(cur, replaced, db)
+                allow_connections(cur, db, True)
+                raise
+
+            try:
+                cur.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(replaced)))
+                print(f"[DROP] Previous copy of {db} dropped")
+            except psycopg2.Error as e:
+                print(f"[WARN] Previous copy kept as {replaced}, drop it manually: {str(e).strip()}")
+    finally:
+        conn.close()
+
+
+def discard_role(db: str) -> bool:
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                if database_exists(cur, db) or not role_exists(cur, db):
+                    return False
+                cur.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(db)))
+        finally:
+            conn.close()
+    except psycopg2.Error as e:
+        print(f"[WARN] Could not remove role {db}: {str(e).strip()}")
+        return False
+    print(f"[ROLLBACK] Role '{db}' created by this restore removed")
+    return True
 
 
 def dump_format(path: pathlib.Path) -> str:
@@ -541,7 +677,7 @@ def load_dump(db: str, path: pathlib.Path, owner: str):
         drop_placeholders(db, placeholders, owner)
 
 
-def restore_from_folder(db: str, folder: pathlib.Path, cleanup_after: bool = False):
+def restore_from_folder(db: str, folder: pathlib.Path, cleanup_after: bool = False, into: str | None = None):
     """
     Restore database from SQL backup file.
 
@@ -563,7 +699,7 @@ def restore_from_folder(db: str, folder: pathlib.Path, cleanup_after: bool = Fal
 
     print(f"[RESTORE] Loading SQL: {sql_path.name} (this may take a while...)")
     try:
-        load_dump(db, sql_path, PGUSER if db == META_DB else db)
+        load_dump(into or db, sql_path, PGUSER if db in SYSTEM_DATABASES else db)
         print("[OK] Restore completed successfully")
     except RestoreError:
         print("[ERROR] Restore failed!")
@@ -600,7 +736,7 @@ def resolve_target_arg(value: str, targets: dict | None) -> metadb.Target:
         remote, _, prefix = value.partition(":")
         if not remote:
             raise RestoreError(f"Invalid target: {value}")
-        return metadb.Target(name=value, type="raw", remote=remote, prefix=prefix.strip("/"), retention_days=0)
+        return metadb.Target(name=value.rstrip(":"), type="raw", remote=remote, prefix=prefix.strip("/"), retention_days=0)
     if targets is None:
         print(f"[WARN] {META_DB} unavailable, treating '{value}' as rclone remote '{value}:'")
         return metadb.Target(name=value, type="raw", remote=value, prefix="", retention_days=0)
@@ -623,6 +759,7 @@ def locate_backup(db: str, candidates: list[metadb.Target], meta, date_arg: str 
     if meta is not None:
         with meta.cursor() as cur:
             runs = metadb.successful_runs(cur, db, list(by_name))
+        skipped = None
         for target_name, folder, filename, _, started_at in runs:
             target = by_name[target_name]
             base = target.location("records", SERVER_NAME) + "/"
@@ -632,20 +769,26 @@ def locate_backup(db: str, candidates: list[metadb.Target], meta, date_arg: str 
             if wanted and date_folder != wanted:
                 continue
             if check_file_in_cloud(target, date_folder, filename):
-                print(f"[FOUND] Latest successful backup ({started_at:%Y-%m-%d %H:%M}): {target.name} {date_folder}/{filename}")
+                print(f"[FOUND] Latest successful backup ({local_time(started_at)}): {target.name} {date_folder}/{filename}")
+                if skipped and folder_date(skipped[1]) > folder_date(date_folder):
+                    print(f"[WARN] A newer backup ({skipped[1]}) is on {skipped[0]}, which is unreachable")
                 return target, date_folder, filename
+            if skipped is None and target.name in UNREACHABLE:
+                skipped = (target.name, date_folder)
 
     best = None
     for target in candidates:
-        listing = list_dump_files(target, db)
-        for date_folder, files in listing.items():
+        listing = scan(target, lambda t: list_dump_files(t, db))
+        for date_folder, files in (listing or {}).items():
             if wanted and date_folder != wanted:
                 continue
             if best is None or folder_date(date_folder) > folder_date(best[1]):
                 best = (target, date_folder, preferred_dump(files, db))
     if best is None:
         where = ", ".join(target.name for target in candidates)
-        raise RestoreError(f"No backup found for '{db}'{' on ' + wanted if wanted else ''} in: {where}")
+        missing = [target.name for target in candidates if target.name in UNREACHABLE]
+        note = f" ({', '.join(missing)} unreachable)" if missing else ""
+        raise RestoreError(f"No backup found for '{db}'{' on ' + wanted if wanted else ''} in: {where}{note}")
     print(f"[FOUND] Database backup found in {best[0].name}: {best[1]}/{best[2]}")
     return best
 
@@ -740,21 +883,21 @@ def grant_memberships(cur, spec: dict):
         )
 
 
-def ensure_project_role(db: str, roles_backup: dict | None, new_password: bool) -> str | None:
+def ensure_project_role(db: str, roles_backup: dict | None, new_password: bool) -> tuple[str | None, bool]:
     conn = connect()
     try:
         with conn.cursor() as cur:
             if role_exists(cur, db):
-                return None
+                return None, False
             spec = None if new_password or roles_backup is None else roles_backup.get(db)
             if spec:
                 create_role_from_backup(cur, spec)
                 grant_memberships(cur, spec)
                 print(f"[ROLE] Role '{db}' restored from {ROLES_FILE} (previous password kept)")
-                return None
+                return None, True
             password = create_role(cur, db)
             print(f"[ROLE] Role '{db}' created with a new password")
-            return password
+            return password, True
     finally:
         conn.close()
 
@@ -804,18 +947,24 @@ def restore_database(db: str, loader, *, roles_backup, safety_targets, meta, ski
     else:
         print("[WARN] Safety backup skipped\n")
 
-    password = None if db == META_DB else ensure_project_role(db, roles_backup, new_password)
+    password, created = (None, False) if db in SYSTEM_DATABASES else ensure_project_role(db, roles_backup, new_password)
+    staging = None
     try:
-        # Terminate connections and recreate DB
-        terminate_connections(db)
-        drop_create_db(db)
+        staging = create_staging_db(db)
 
         # Restore data
-        loader()
+        loader(staging)
+
+        # Terminate connections and recreate DB
+        swap_database(db, staging)
 
         # Verify
         list_tables(db)
-    except Exception:
+    except BaseException:
+        if staging:
+            drop_staging_db(db, staging)
+        if created and discard_role(db):
+            password = None
         if password:
             print(f"[WARN] Restore of '{db}' failed after its role was created; the new credentials follow")
             print_connection_info(db, password)
@@ -831,7 +980,14 @@ def validate_restore_name(db: str):
         raise RestoreError(f"Invalid database name '{db}': {error}")
 
 
-def restore_single(args, meta, targets, policies):
+def finish() -> int:
+    if not UNREACHABLE:
+        return 0
+    print(f"[WARN] Unreachable target(s): {unreachable_report()}")
+    return 1
+
+
+def restore_single(args, meta, targets, policies) -> int:
     db = args.dbname
     validate_restore_name(db)
     if args.target:
@@ -843,20 +999,27 @@ def restore_single(args, meta, targets, policies):
         if not candidates:
             raise RestoreError(f"No enabled backup target for '{db}'")
 
-    # Find appropriate cloud backup
-    target, date_folder, filename = locate_backup(db, candidates, meta, args.date)
-    location = target.location("records", SERVER_NAME, date_folder)
-
-    print("="*60)
-    print(f"[INFO] Source       : {location}/{filename}")
-    print(f"[INFO] Target database: {db}")
-    print(f"[INFO] Server        : {PGUSER}@{PGHOST}:{PGPORT}")
-    print("="*60 + "\n")
-
-    # Download only the single .sql file from cloud
     temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="restore_"))
     try:
-        download_from_cloud(target, date_folder, temp_dir, dbname=db)
+        while True:
+            # Find appropriate cloud backup
+            target, date_folder, filename = locate_backup(db, candidates, meta, args.date)
+            location = target.location("records", SERVER_NAME, date_folder)
+
+            print("="*60)
+            print(f"[INFO] Source       : {location}/{filename}")
+            print(f"[INFO] Target database: {db}")
+            print(f"[INFO] Server        : {PGUSER}@{PGHOST}:{PGPORT}")
+            print("="*60 + "\n")
+
+            # Download only the single .sql file from cloud
+            try:
+                download_from_cloud(target, date_folder, temp_dir, dbname=db)
+                break
+            except subprocess.CalledProcessError as e:
+                mark_unreachable(target, f"download failed (rclone exit code {e.returncode})")
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                temp_dir.mkdir()
 
         # Verify backup was downloaded
         if not (temp_dir / filename).exists():
@@ -868,7 +1031,7 @@ def restore_single(args, meta, targets, policies):
         safety_targets = policy_targets(db, targets, policies) or [target]
         password, safety_cloud_path = restore_database(
             db,
-            lambda: restore_from_folder(db, temp_dir),
+            lambda staging: restore_from_folder(db, temp_dir, into=staging),
             roles_backup=roles_backup,
             safety_targets=safety_targets,
             meta=meta,
@@ -890,9 +1053,10 @@ def restore_single(args, meta, targets, policies):
         # Always cleanup temp directory
         print(f"[CLEANUP] Removing temporary files: {temp_dir}")
         shutil.rmtree(temp_dir, ignore_errors=True)
+    return finish()
 
 
-def restore_file(args, meta, targets, policies):
+def restore_file(args, meta, targets, policies) -> int:
     db = args.dbname
     validate_restore_name(db)
     path = pathlib.Path(args.from_file)
@@ -911,7 +1075,7 @@ def restore_file(args, meta, targets, policies):
     existed = db_exists(db)
     password, safety_cloud_path = restore_database(
         db,
-        lambda: load_dump(db, path, PGUSER if db == META_DB else db),
+        lambda staging: load_dump(staging, path, PGUSER if db in SYSTEM_DATABASES else db),
         roles_backup=None,
         safety_targets=safety_targets,
         meta=meta,
@@ -928,13 +1092,14 @@ def restore_file(args, meta, targets, policies):
     print("="*60 + "\n")
     if password:
         print_connection_info(db, password)
+    return finish()
 
 
 def confirm_all(date_folder: str, plan: dict, databases: list[str]) -> bool:
     print(f"[CONFIRM] This restores roles and {len(databases)} database(s) from {date_folder}:")
     for db in databases:
         print(f"          {db} <- {plan[db][0].name}")
-    print("          Existing databases with the same names are dropped (after a safety backup).")
+    print("          Existing databases with the same names are replaced once their copy has loaded (after a safety backup).")
     if not sys.stdin.isatty():
         print("[ERROR] Confirmation required: run interactively or pass --yes")
         return False
@@ -952,37 +1117,66 @@ def meta_is_empty(meta) -> bool:
         return True
 
 
-def collect_dumps(sources: list[metadb.Target], date_folder: str) -> tuple[list, dict]:
+def dump_names(files: list[str]) -> set[str]:
+    return {name.removesuffix(".gz").removesuffix(".sql") for name in files if name.endswith(DUMP_SUFFIXES)}
+
+
+def collect_dumps(sources: list[metadb.Target], date_folder: str) -> list:
     folders = []
     for source in sources:
-        files = rclone_list([source.location("records", SERVER_NAME, date_folder), "--files-only"])
-        if files is not None:
+        files = scan(source, lambda t: rclone_list([t.location("records", SERVER_NAME, date_folder), "--files-only"]))
+        if files:
             folders.append((source, files))
-    folders.sort(key=lambda item: -sum(name.endswith(DUMP_SUFFIXES) for name in item[1]))
+    folders.sort(key=lambda item: -len(dump_names(item[1])))
+    return folders
+
+
+def plan_dumps(folders: list) -> dict:
     plan = {}
     for source, files in folders:
-        for db in sorted({name.removesuffix(".gz").removesuffix(".sql") for name in files if name.endswith(DUMP_SUFFIXES)}):
+        for db in sorted(dump_names(files)):
             plan.setdefault(db, (source, preferred_dump(files, db)))
-    return folders, plan
+    return plan
 
 
-def fetch_dumps(folders: list, plan: dict, date_folder: str, temp_dir: pathlib.Path, meta, with_roles: bool) -> dict | None:
+def fetch_dumps(folders: list, databases: list[str], date_folder: str, temp_dir: pathlib.Path, meta, with_roles: bool):
+    fetched = {}
+    errors = {}
     roles_backup = None
     for source, files in folders:
-        wanted = [filename for used, filename in plan.values() if used == source]
-        if with_roles and roles_backup is None and ROLES_FILE in files:
-            wanted.append(ROLES_FILE)
-        if not wanted:
+        if source.name in UNREACHABLE:
+            continue
+        available = dump_names(files)
+        wanted = {db: preferred_dump(files, db) for db in databases if db in available and db not in fetched}
+        fetch_roles = with_roles and roles_backup is None and ROLES_FILE in files
+        if not wanted and not fetch_roles:
             continue
         folder = temp_dir / source.name
         location = source.location("records", SERVER_NAME, date_folder)
-        download_selected(source, date_folder, folder, wanted)
-        for filename in wanted:
-            if filename != ROLES_FILE:
+        try:
+            download_selected(source, date_folder, folder, [*wanted.values(), *([ROLES_FILE] if fetch_roles else [])])
+        except subprocess.CalledProcessError as e:
+            mark_unreachable(source, f"download failed (rclone exit code {e.returncode})")
+            continue
+        if fetch_roles:
+            try:
+                roles_backup = load_roles_backup(folder, location, meta)
+            except RestoreError as e:
+                print(f"[ERROR] {ROLES_FILE} from {source.name}: {e}")
+        for db, filename in wanted.items():
+            try:
                 verify_checksum(folder, location, filename, meta)
-        if ROLES_FILE in wanted:
-            roles_backup = load_roles_backup(folder, location, meta)
-    return roles_backup
+            except RestoreError as e:
+                print(f"[ERROR] {db} from {source.name}: {e}")
+                errors[db] = str(e)
+                continue
+            fetched[db] = (source, filename)
+            errors.pop(db, None)
+    for db in databases:
+        if db not in fetched and db not in errors:
+            errors[db] = "dump could not be downloaded from any reachable target"
+            print(f"[ERROR] {db}: {errors[db]}")
+    return fetched, roles_backup, errors
 
 
 def restore_all(args, meta, targets, policies) -> int:
@@ -994,9 +1188,11 @@ def restore_all(args, meta, targets, policies) -> int:
     else:
         raise RestoreError(f"No backup target known in {META_DB}, pass --target <rclone-remote>:<prefix>")
 
-    folders, plan = collect_dumps(sources, date_folder)
+    folders = collect_dumps(sources, date_folder)
+    plan = plan_dumps(folders)
     if not plan:
-        raise RestoreError(f"No database dumps for {date_folder} in: {', '.join(s.name for s in sources)}")
+        note = f" (unreachable: {unreachable_report()})" if UNREACHABLE else ""
+        raise RestoreError(f"No database dumps for {date_folder} in: {', '.join(s.name for s in sources)}{note}")
     databases = sorted(plan, key=lambda name: (name != META_DB, name))
 
     if not args.yes and not confirm_all(date_folder, plan, databases):
@@ -1004,25 +1200,26 @@ def restore_all(args, meta, targets, policies) -> int:
         return 1
 
     temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="restore_all_"))
-    failures = []
+    failures = {}
+    restored = []
     created_passwords = {}
-    used_sources = {source.name for source, _ in folders}
+    fetched = {}
+    scanned = {source.name for source in sources}
     try:
-        roles_backup = fetch_dumps(folders, plan, date_folder, temp_dir, meta, with_roles=True)
+        fetched, roles_backup, errors = fetch_dumps(folders, databases, date_folder, temp_dir, meta, with_roles=True)
+        failures.update(errors)
         if roles_backup:
-            restored = restore_roles(roles_backup)
-            print(f"[OK] Roles restored: {len(restored)}")
+            print(f"[OK] Roles restored: {len(restore_roles(roles_backup))}")
         else:
             print(f"[WARN] {ROLES_FILE} not found, missing roles get new passwords")
 
         index = 0
-        skip = set()
         while index < len(databases):
             db = databases[index]
             index += 1
-            if db in skip:
+            if db not in fetched:
                 continue
-            source, filename = plan[db]
+            source, filename = fetched[db]
             print("\n" + "="*60)
             print(f"[RESTORE] {db} <- {source.location('records', SERVER_NAME, date_folder)}/{filename}")
             print("="*60)
@@ -1031,7 +1228,7 @@ def restore_all(args, meta, targets, policies) -> int:
                 validate_restore_name(db)
                 password, _ = restore_database(
                     db,
-                    lambda db=db, source=source: restore_from_folder(db, temp_dir / source.name),
+                    lambda staging, db=db, source=source: restore_from_folder(db, temp_dir / source.name, into=staging),
                     roles_backup=roles_backup,
                     safety_targets=policy_targets(db, targets, policies) or [source],
                     meta=meta,
@@ -1042,8 +1239,9 @@ def restore_all(args, meta, targets, policies) -> int:
                     created_passwords[db] = password
             except (RestoreError, psycopg2.Error, subprocess.CalledProcessError) as e:
                 print(f"[ERROR] {db}: {str(e).strip()}")
-                failures.append(db)
+                failures[db] = str(e).strip()
                 continue
+            restored.append(db)
 
             if db != META_DB:
                 if META_DB not in plan:
@@ -1058,21 +1256,18 @@ def restore_all(args, meta, targets, policies) -> int:
                 metadb.ensure_schema(cur)
             if args.target:
                 continue
-            extra_sources = [t for t in targets.values() if t.enabled and t.name not in used_sources]
-            extra_folders, extra_plan = collect_dumps(extra_sources, date_folder)
-            extra_plan = {name: entry for name, entry in extra_plan.items() if name not in plan}
+            extra_sources = [t for t in targets.values() if t.enabled and t.name not in scanned]
+            scanned |= {t.name for t in extra_sources}
+            extra_folders = collect_dumps(extra_sources, date_folder)
+            extra_plan = {name: entry for name, entry in plan_dumps(extra_folders).items() if name not in plan}
             if not extra_plan:
                 continue
             print(f"[FOUND] Targets restored from {META_DB} hold more databases: {', '.join(sorted(extra_plan))}")
             plan.update(extra_plan)
             databases.extend(sorted(extra_plan))
-            used_sources |= {source.name for source, _ in extra_folders}
-            try:
-                fetch_dumps(extra_folders, extra_plan, date_folder, temp_dir, meta, with_roles=False)
-            except (RestoreError, subprocess.CalledProcessError) as e:
-                print(f"[ERROR] {', '.join(sorted(extra_plan))}: {str(e).strip()}")
-                failures.extend(sorted(extra_plan))
-                skip |= set(extra_plan)
+            more, _, errors = fetch_dumps(extra_folders, sorted(extra_plan), date_folder, temp_dir, meta, with_roles=False)
+            fetched.update(more)
+            failures.update(errors)
     finally:
         if meta is not None:
             meta.close()
@@ -1081,18 +1276,28 @@ def restore_all(args, meta, targets, policies) -> int:
 
     for db, password in created_passwords.items():
         print_connection_info(db, password)
+    used = sorted({fetched[db][0].name for db in restored})
     print("\n" + "="*60)
     print(
-        f"[SUMMARY] Restored {len(databases) - len(failures)}/{len(databases)} database(s) of {date_folder} "
-        f"from {', '.join(sorted(used_sources))}"
+        f"[SUMMARY] Restored {len(restored)}/{len(databases)} database(s) of {date_folder} "
+        f"from {', '.join(used) or 'no target'}"
     )
     if failures:
-        print(f"[SUMMARY] Failed: {', '.join(failures)}")
+        print(f"[SUMMARY] Failed: {', '.join(sorted(failures))}")
+    if UNREACHABLE:
+        print(f"[SUMMARY] Unreachable target(s): {unreachable_report()}")
+        hidden = sorted(
+            name
+            for name, entries in (policies or {}).items()
+            if name not in plan and any(target in UNREACHABLE for target, enabled in entries if enabled)
+        )
+        if hidden:
+            print(f"[SUMMARY] Not found, their policy includes an unreachable target: {', '.join(hidden)}")
     print("="*60 + "\n")
-    return 1 if failures else 0
+    return 1 if failures or UNREACHABLE else 0
 
 
-def list_backups(args, targets):
+def list_backups(args, targets) -> int:
     if args.target:
         selected = [resolve_target_arg(args.target, targets)]
     elif targets is None:
@@ -1105,7 +1310,10 @@ def list_backups(args, targets):
     for target in selected:
         state = "" if target.enabled else " (disabled)"
         print(f"\n[{target.name}]{state} {target.location('records', SERVER_NAME)}")
-        listing = list_dump_files(target, args.dbname)
+        listing = scan(target, lambda t: list_dump_files(t, args.dbname))
+        if listing is None:
+            print("  (unreachable)")
+            continue
         if not listing:
             print("  (no backups)")
             continue
@@ -1113,6 +1321,7 @@ def list_backups(args, targets):
             names = sorted(name.removesuffix(".gz").removesuffix(".sql") for name in listing[date_folder])
             detail = ", ".join(sorted(listing[date_folder])) if args.dbname else ", ".join(names)
             print(f"  {folder_date(date_folder).isoformat()}  {detail}")
+    return finish()
 
 
 def main():
@@ -1159,21 +1368,21 @@ Examples:
     meta, targets, policies = open_meta()
     try:
         if args.list:
-            list_backups(args, targets)
+            status = list_backups(args, targets)
         elif args.all:
             status = restore_all(args, meta, targets, policies)
             meta = None
-            sys.exit(status)
         elif args.from_file:
-            restore_file(args, meta, targets, policies)
+            status = restore_file(args, meta, targets, policies)
         else:
-            restore_single(args, meta, targets, policies)
+            status = restore_single(args, meta, targets, policies)
     except (RestoreError, metadb.MetaError, psycopg2.Error) as e:
         print(f"[ERROR] {str(e).strip()}")
         sys.exit(1)
     finally:
         if meta is not None:
             meta.close()
+    sys.exit(status)
 
 
 if __name__ == "__main__":

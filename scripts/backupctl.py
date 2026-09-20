@@ -9,7 +9,7 @@ import psycopg2
 from psycopg2 import sql
 
 import metadb
-from common import META_DB, SERVER_NAME, connect, db_exists
+from common import META_DB, SERVER_NAME, connect, db_exists, local_time
 
 
 def human_size(size: int | None) -> str:
@@ -143,9 +143,9 @@ def show(cur, args):
     if rows:
         print("\nLast backup per target:")
         print_table(
-            ("TARGET", "STARTED", "STATUS", "SIZE", "LOCATION", "ERROR"),
+            ("TARGET", "STARTED (TRT)", "STATUS", "SIZE", "LOCATION", "ERROR"),
             [
-                (target, f"{started:%Y-%m-%d %H:%M}", status, human_size(size), f"{folder}/{filename}", error)
+                (target, local_time(started), status, human_size(size), f"{folder}/{filename}", error)
                 for target, started, status, size, folder, filename, error in rows
             ],
         )
@@ -180,9 +180,9 @@ def list_runs(cur, args):
         print("No backup runs recorded.")
         return
     print_table(
-        ("STARTED", "DATABASE", "TARGET", "KIND", "STATUS", "SIZE", "DURATION", "ERROR"),
+        ("STARTED (TRT)", "DATABASE", "TARGET", "KIND", "STATUS", "SIZE", "DURATION", "ERROR"),
         [
-            (f"{started:%Y-%m-%d %H:%M}", db, target, kind, status, human_size(size), duration, error)
+            (local_time(started), db, target, kind, status, human_size(size), duration, error)
             for started, db, target, kind, status, size, duration, error in rows
         ],
     )

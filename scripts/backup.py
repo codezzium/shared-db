@@ -18,7 +18,17 @@ from dataclasses import dataclass
 import psycopg2
 
 import metadb
-from common import BACKUP_PASSWORD, BACKUP_ROLE, META_DB, PGHOST, PGPORT, SERVER_NAME, connect
+from common import (
+    BACKUP_PASSWORD,
+    BACKUP_ROLE,
+    META_DB,
+    PGHOST,
+    PGPORT,
+    SERVER_NAME,
+    SERVICE_ROLES,
+    TRANSIENT_PREFIXES,
+    connect,
+)
 
 PGUSER = BACKUP_ROLE
 PGPASSWORD = BACKUP_PASSWORD
@@ -45,6 +55,8 @@ SELECT r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb, r.ro
        coalesce((SELECT s.setconfig FROM pg_db_role_setting s WHERE s.setrole = r.oid AND s.setdatabase = 0), '{}')
 FROM pg_authid r
 WHERE r.rolname !~ '^pg_'
+  AND NOT r.rolsuper
+  AND r.rolname <> ALL(%s)
 ORDER BY r.rolname
 """
 
@@ -272,7 +284,7 @@ def dump_roles(output_path: pathlib.Path):
     conn = connect()
     try:
         with conn.cursor() as cur:
-            cur.execute(ROLES_QUERY)
+            cur.execute(ROLES_QUERY, (list(SERVICE_ROLES),))
             roles = [
                 {
                     "name": row[0],
@@ -304,7 +316,7 @@ def dump_roles(output_path: pathlib.Path):
     }
     output_path.write_text(json.dumps(payload, indent=2))
     output_path.chmod(0o600)
-    print(f"[OK] Roles dumped: {len(roles)} role(s) -> {output_path.name}")
+    print(f"[OK] Roles dumped: {len(roles)} project role(s) -> {output_path.name}")
 
 
 def record(meta, result: dict, **run_fields):
@@ -452,6 +464,11 @@ def backup_all_databases():
 
         plan = {}
         for db in list_databases():
+            if db.startswith(TRANSIENT_PREFIXES):
+                warning = f"{db} is left over from an interrupted restore and is not backed up; drop it once checked"
+                print(f"[WARN] {warning}")
+                result["warnings"].append(warning)
+                continue
             chosen, source = metadb.resolve_targets(db, targets, policies, defaults)
             if source == "default":
                 warning = (

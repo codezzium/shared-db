@@ -1,47 +1,20 @@
 #!/usr/bin/env python3
-import json
 import os
 import re
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 
 import psycopg2
 
 import metadb
+from garage_admin import ADMIN_TOKEN, ADMIN_URL, BACKUP_BUCKET, GarageError, call, find_bucket
 
-ADMIN_URL = os.getenv("GARAGE_ADMIN_URL", "http://garage:3903")
-ADMIN_TOKEN = os.getenv("GARAGE_ADMIN_TOKEN")
-BUCKET = os.getenv("GARAGE_BUCKET", "shared-db-backups")
+BUCKET = BACKUP_BUCKET
 CAPACITY_GB = int(os.getenv("GARAGE_CAPACITY_GB", "100"))
 ACCESS_KEY_ID = os.getenv("RCLONE_CONFIG_GARAGE_ACCESS_KEY_ID", "")
 SECRET_ACCESS_KEY = os.getenv("RCLONE_CONFIG_GARAGE_SECRET_ACCESS_KEY", "")
 TARGET_NAME = "garage"
 TARGET_REMOTE = "garage"
-
-
-class GarageError(Exception):
-    pass
-
-
-def call(method: str, endpoint: str, body: dict | None = None, query: dict | None = None):
-    url = f"{ADMIN_URL}/v2/{endpoint}"
-    if query:
-        url += "?" + urllib.parse.urlencode(query)
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode() if body is not None else None,
-        method=method,
-        headers={"Authorization": f"Bearer {ADMIN_TOKEN}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            payload = response.read()
-    except urllib.error.HTTPError as e:
-        raise GarageError(f"{endpoint}: HTTP {e.code} {e.read().decode(errors='replace').strip()}") from None
-    return json.loads(payload) if payload else None
 
 
 def wait_for_garage() -> dict:
@@ -71,10 +44,10 @@ def ensure_layout(status: dict):
 
 
 def ensure_bucket() -> str:
-    try:
-        bucket = call("GET", "GetBucketInfo", query={"globalAlias": BUCKET})
+    bucket = find_bucket(BUCKET)
+    if bucket:
         print(f"[OK] Bucket exists: {BUCKET}")
-    except GarageError:
+    else:
         bucket = call("POST", "CreateBucket", {"globalAlias": BUCKET})
         print(f"[OK] Bucket created: {BUCKET}")
     return bucket["id"]
@@ -108,14 +81,19 @@ def register_target():
         with conn.cursor() as cur:
             if TARGET_NAME in metadb.load_targets(cur):
                 print(f"[OK] Backup target already registered: {TARGET_NAME}")
-                return
-            cur.execute(
-                "INSERT INTO targets (name, type, remote, prefix, retention_days) VALUES (%s, 's3', %s, %s, %s)",
-                (TARGET_NAME, TARGET_REMOTE, BUCKET, int(os.getenv("BACKUP_RETENTION_DAYS", "15"))),
-            )
-            print(f"[OK] Backup target registered: {TARGET_NAME} -> {TARGET_REMOTE}:{BUCKET}")
+            else:
+                cur.execute(
+                    "INSERT INTO targets (name, type, remote, prefix, retention_days) VALUES (%s, 's3', %s, %s, %s)",
+                    (TARGET_NAME, TARGET_REMOTE, BUCKET, int(os.getenv("BACKUP_RETENTION_DAYS", "15"))),
+                )
+                print(f"[OK] Backup target registered: {TARGET_NAME} -> {TARGET_REMOTE}:{BUCKET}")
     finally:
         conn.close()
+    if TARGET_NAME in metadb.default_target_names():
+        print(
+            f"[WARN] BACKUP_DEFAULT_TARGETS includes {TARGET_NAME}, which lives on this server's disk; "
+            "it is not an off-site backup, keep an off-site target as the default"
+        )
 
 
 def main():

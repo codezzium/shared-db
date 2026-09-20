@@ -1,8 +1,9 @@
 services:
   db:
-    image: pgvector/pgvector:pg18-trixie
+    image: pgvector/pgvector:0.8.6-pg18-trixie
     container_name: shared-db
     restart: unless-stopped
+    mem_limit: ${DB_MEM_LIMIT:-2g}
     shm_size: 512mb
     env_file: .env
     environment:
@@ -30,6 +31,7 @@ services:
     build: ./scripts
     container_name: shared-db-init
     restart: "no"
+    mem_limit: 256m
     env_file: .env
     environment:
       BACKUP_PASSWORD: ${BACKUP_PASSWORD:?BACKUP_PASSWORD is required}
@@ -49,9 +51,10 @@ services:
         max-file: "3"
 
   pgbouncer:
-    image: edoburu/pgbouncer:latest
+    image: edoburu/pgbouncer:v1.25.2-p0
     container_name: shared-pgbouncer
     restart: unless-stopped
+    mem_limit: ${PGBOUNCER_MEM_LIMIT:-128m}
     environment:
       DB_USER: pgbouncer_auth
       DB_PASSWORD: ${PGBOUNCER_AUTH_PASSWORD:?PGBOUNCER_AUTH_PASSWORD is required}
@@ -65,6 +68,11 @@ services:
         condition: service_healthy
       db-init:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "pg_isready", "-q", "-h", "127.0.0.1", "-p", "5432", "-U", "pgbouncer_stats", "-d", "pgbouncer"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     networks:
       shared-db-internal:
         ipv4_address: 10.250.0.10
@@ -76,7 +84,7 @@ services:
         max-file: "3"
 
   # pgadmin:
-  #   image: dpage/pgadmin4
+  #   image: dpage/pgadmin4:9.18.0
   #   container_name: shared-pgadmin
   #   restart: unless-stopped
   #   env_file: .env
@@ -96,9 +104,10 @@ services:
   #     driver: "none"
 
   redis:
-    image: redis:8.8.2-alpine
+    image: redis:8.8.2-alpine3.23
     container_name: shared-redis
     restart: unless-stopped
+    mem_limit: ${REDIS_MEM_LIMIT:-1g}
     entrypoint: ["/bin/sh", "/usr/local/etc/redis/entrypoint.sh"]
     environment:
       REDIS_ADMIN_PASSWORD: ${REDIS_ADMIN_PASSWORD:?REDIS_ADMIN_PASSWORD is required}
@@ -123,10 +132,11 @@ services:
         max-file: "3"
 
   garage:
-    image: dxflrs/garage:v2.3.0
+    image: dxflrs/garage:v2.4.1
     container_name: shared-garage
     restart: unless-stopped
     profiles: ["garage"]
+    mem_limit: ${GARAGE_MEM_LIMIT:-512m}
     environment:
       GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-}
       GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-}
@@ -140,7 +150,9 @@ services:
       timeout: 5s
       retries: 10
     networks:
-      - shared-db-internal
+      shared-db-internal:
+        ipv4_address: 10.250.0.11
+      shared-db-net:
     logging:
       driver: "json-file"
       options:
@@ -152,6 +164,7 @@ services:
     container_name: shared-garage-init
     restart: "no"
     profiles: ["garage"]
+    mem_limit: 256m
     env_file: .env
     command: ["python", "/app/garage_init.py"]
     depends_on:
@@ -173,6 +186,7 @@ services:
     build: ./scripts
     container_name: shared-pgbackup
     restart: unless-stopped
+    mem_limit: ${PGBACKUP_MEM_LIMIT:-512m}
     env_file: .env
     environment:
       BACKUP_PASSWORD: ${BACKUP_PASSWORD:?BACKUP_PASSWORD is required}
