@@ -1,4 +1,4 @@
-# 🐘 Shared PostgreSQL Backup System
+# 🐘 Shared PostgreSQL Backup System [BU BİR HAKAN KARATOPAK PROJESİDİR. TÜM SORUMLULUK BANA AİTTİR.]
 
 Cloud-first PostgreSQL backup and restore system with automated daily backups, Google Drive integration, and zero local storage.
 
