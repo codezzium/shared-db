@@ -10,10 +10,16 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      HBA_TEMPLATE: /etc/postgresql/pg_hba.conf.template
+      HBA_FILE: /etc/postgresql/pg_hba.conf
+      INTERNAL_SUBNET: ${INTERNAL_SUBNET:-10.250.0.0/24}
+      PGBOUNCER_IP: ${PGBOUNCER_IP:-10.250.0.10}
+    entrypoint: ["/bin/sh", "/usr/local/bin/render-hba.sh", "docker-entrypoint.sh"]
     command: ["postgres", "-c", "hba_file=/etc/postgresql/pg_hba.conf"]
     volumes:
       - postgres_data:/var/lib/postgresql
-      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf.template:ro
+      - ./render-hba.sh:/usr/local/bin/render-hba.sh:ro
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d postgres -h localhost -p 5432" ]
       interval: 10s
@@ -29,6 +35,7 @@ services:
 
   db-init:
     build: ./scripts
+    image: shared-db-db-init:latest
     container_name: shared-db-init
     restart: "no"
     mem_limit: 256m
@@ -59,10 +66,17 @@ services:
       DB_USER: pgbouncer_auth
       DB_PASSWORD: ${PGBOUNCER_AUTH_PASSWORD:?PGBOUNCER_AUTH_PASSWORD is required}
       AUTH_TYPE: scram-sha-256
+      HBA_TEMPLATE: /etc/pgbouncer/pgbouncer_hba.conf.template
+      HBA_FILE: /etc/pgbouncer/pgbouncer_hba.conf
+      INTERNAL_SUBNET: ${INTERNAL_SUBNET:-10.250.0.0/24}
+      PGBOUNCER_IP: ${PGBOUNCER_IP:-10.250.0.10}
+    entrypoint: ["/bin/sh", "/usr/local/bin/render-hba.sh", "/entrypoint.sh"]
+    command: ["/usr/bin/pgbouncer", "/etc/pgbouncer/pgbouncer.ini"]
     # Pool sizes and per-user budgets are maintained in pgbouncer.ini.
     volumes:
       - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
-      - ./pgbouncer_hba.conf:/etc/pgbouncer/pgbouncer_hba.conf:ro
+      - ./pgbouncer_hba.conf:/etc/pgbouncer/pgbouncer_hba.conf.template:ro
+      - ./render-hba.sh:/usr/local/bin/render-hba.sh:ro
     depends_on:
       db:
         condition: service_healthy
@@ -75,7 +89,7 @@ services:
       retries: 3
     networks:
       shared-db-internal:
-        ipv4_address: 10.250.0.10
+        ipv4_address: ${PGBOUNCER_IP:-10.250.0.10}
       shared-db-net:
     logging:
       driver: "json-file"
@@ -140,8 +154,10 @@ services:
     environment:
       GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-}
       GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-}
+    configs:
+      - source: garage_toml
+        target: /etc/garage.toml
     volumes:
-      - ./garage/garage.toml:/etc/garage.toml:ro
       - garage_meta:/var/lib/garage/meta
       - ${GARAGE_DATA_DIR:-garage_data}:/var/lib/garage/data
     healthcheck:
@@ -151,7 +167,7 @@ services:
       retries: 10
     networks:
       shared-db-internal:
-        ipv4_address: 10.250.0.11
+        ipv4_address: ${GARAGE_IP:-10.250.0.11}
       shared-db-net:
     logging:
       driver: "json-file"
@@ -161,6 +177,7 @@ services:
 
   garage-init:
     build: ./scripts
+    image: shared-db-garage-init:latest
     container_name: shared-garage-init
     restart: "no"
     profiles: ["garage"]
@@ -184,6 +201,7 @@ services:
 
   pgbackup:
     build: ./scripts
+    image: shared-db-pgbackup:latest
     container_name: shared-pgbackup
     restart: unless-stopped
     mem_limit: ${PGBACKUP_MEM_LIMIT:-512m}
@@ -222,6 +240,24 @@ volumes:
   garage_meta:
   garage_data:
 
+configs:
+  garage_toml:
+    content: |
+      metadata_dir = "/var/lib/garage/meta"
+      data_dir = "/var/lib/garage/data"
+      db_engine = "lmdb"
+      replication_factor = 1
+      rpc_bind_addr = "127.0.0.1:3901"
+      rpc_public_addr = "127.0.0.1:3901"
+
+      [s3_api]
+      s3_region = "garage"
+      api_bind_addr = "[::]:3900"
+      root_domain = ".s3.garage.local"
+
+      [admin]
+      api_bind_addr = "${GARAGE_IP:-10.250.0.11}:3903"
+
 networks:
   shared-db-net:
     name: shared-db-net
@@ -232,5 +268,5 @@ networks:
     internal: true
     ipam:
       config:
-        - subnet: 10.250.0.0/24
-          ip_range: 10.250.0.128/25
+        - subnet: ${INTERNAL_SUBNET:-10.250.0.0/24}
+          ip_range: ${INTERNAL_IP_RANGE:-10.250.0.128/25}

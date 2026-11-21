@@ -63,9 +63,17 @@ Applications ── shared-db-net (external) ──┬────────�
 ```
 
 - `shared-db-net` is the only network applications join. It holds PgBouncer, Redis and the S3 API of Garage, never Postgres.
-- `shared-db-internal` (`internal: true`, `10.250.0.0/24`) holds Postgres, PgBouncer (`10.250.0.10`), pgBackup, the one-shot `db-init` and, when enabled, Garage (`10.250.0.11`). pgBackup also joins the compose `default` network for rclone's internet access.
-- Garage's admin API listens on `10.250.0.11:3903` only and its RPC port on `127.0.0.1` inside the container, so applications can use S3 but cannot manage buckets or keys.
+- `shared-db-internal` (`internal: true`, `INTERNAL_SUBNET`, default `10.250.0.0/24`) holds Postgres, PgBouncer (`PGBOUNCER_IP`, default `10.250.0.10`), pgBackup, the one-shot `db-init` and, when enabled, Garage (`GARAGE_IP`, default `10.250.0.11`). pgBackup also joins the compose `default` network for rclone's internet access. The addresses come from `.env`, so a second installation on the same host (another engine, for example) only needs different values there.
+- Garage's admin API listens on `GARAGE_IP:3903` only and its RPC port on `127.0.0.1` inside the container, so applications can use S3 but cannot manage buckets or keys. Its configuration is the `garage_toml` config in `docker-compose.yml`; Compose does not recreate the container when only that content changes, so apply an edit with `docker-compose up -d --force-recreate garage`.
 - `pg_hba.conf` accepts only `sameuser` project logins from PgBouncer's address and rejects `postgres`/`backup` there; `postgres` and `backup` may connect only from the rest of the internal network.
+- `pg_hba.conf` and `pgbouncer_hba.conf` are templates: `render-hba.sh` replaces `@INTERNAL_SUBNET@` and `@PGBOUNCER_IP@` with the `.env` values every time the container starts. On an installation older than this layout, run `docker-compose up -d` right after pulling: its running `db` and `pgbouncer` still mount the hba files directly and would read the raw templates on their next restart. After editing one, run `docker-compose restart db` (or `pgbouncer`), or re-render and reload without a restart:
+
+```bash
+docker-compose exec db sh /usr/local/bin/render-hba.sh
+docker exec -e PGPASSWORD=<POSTGRES_PASSWORD> shared-db psql -U postgres -c "SELECT pg_reload_conf()"
+docker-compose exec pgbouncer sh /usr/local/bin/render-hba.sh && docker-compose kill -s HUP pgbouncer
+```
+
 - `db-init` runs `bootstrap.py` on every `docker compose up`; PgBouncer and pgBackup start only after it succeeds.
 
 ### Backup Flow
@@ -223,7 +231,7 @@ docker-compose ps
 
 | Service | Port | Description |
 |---------|------|-------------|
-| `db` | - (internal network only) | PostgreSQL 18 + pgvector, `pg_hba.conf` mounted from the repo |
+| `db` | - (internal network only) | PostgreSQL 18 + pgvector, `pg_hba.conf` rendered from the repo at start |
 | `db-init` | - | One-shot: service roles, PgBouncer auth function and `backup_meta` schema |
 | `pgbouncer` | - (never published to the host) | Connection pooler, the only entry point for applications; `pg_isready` healthcheck |
 | `redis` | - (never published to the host) | Shared Redis 8 (`shared-redis`) on `shared-db-net`, AOF on, `noeviction` |
@@ -247,6 +255,8 @@ Every image is pinned to an exact version and every service has a memory limit, 
 | `PGBOUNCER_ADMIN_PASSWORD` | - | Enables the `pgbouncer_admin` console user; empty disables its login |
 | `PGBOUNCER_STATS_PASSWORD` | - | Enables the `pgbouncer_stats` console user, which PgBouncer's healthcheck also uses; empty disables its login and makes every check log a warning |
 | `SERVER_NAME` | - | **Required**: Server name used in backup paths (`records/<SERVER_NAME>/...`) |
+| `INTERNAL_SUBNET` / `INTERNAL_IP_RANGE` | `10.250.0.0/24` / `10.250.0.128/25` | Subnet of `shared-db-internal` and the range Docker assigns from; also written into both hba files |
+| `PGBOUNCER_IP` / `GARAGE_IP` | `10.250.0.10` / `10.250.0.11` | Fixed addresses inside `INTERNAL_SUBNET`, outside `INTERNAL_IP_RANGE` |
 | `BACKUP_RETENTION_DAYS` | `15` | Retention of the seeded `gdrive` target and default of `backupctl target add` |
 | `RCLONE_REMOTE` | `grdive:` | rclone remote of the seeded `gdrive` target |
 | `BACKUP_DEFAULT_TARGETS` | `gdrive` | Comma-separated targets for new databases and for databases without a policy |
@@ -484,7 +494,7 @@ docker compose exec pgbackup python /app/rms3.py my_django_app        # bucket, 
 
 - The bucket is the project name with `_` replaced by `-` (S3 names cannot contain underscores), so `my_django_app` gets `my-django-app`.
 - The key may read and write only that bucket. It cannot create buckets, delete its own bucket or touch the backup bucket, and the secret is shown once.
-- Applications reach the S3 API at `http://shared-garage:3900` from `shared-db-net`. The admin API (`10.250.0.11:3903`) and the RPC port stay on the internal network, so `mks3.py`/`rms3.py` only work from `pgbackup`.
+- Applications reach the S3 API at `http://shared-garage:3900` from `shared-db-net`. The admin API (`GARAGE_IP:3903`) and the RPC port stay on the internal network, so `mks3.py`/`rms3.py` only work from `pgbackup`.
 - Browsers cannot resolve `shared-garage`; serve files through the application (or its own reverse proxy) instead of handing out presigned URLs directly.
 
 Django with `django-storages[s3]`:
@@ -548,15 +558,13 @@ docker compose exec pgbackup python /app/backupctl.py runs
 shared-db/
 ├── docker-compose.yml          # Orchestration configuration
 ├── pgbouncer.ini               # PgBouncer pooling, auth_query and per-project limits
-├── pgbouncer_hba.conf          # PgBouncer client rules (service users only from the internal network)
-├── pg_hba.conf                 # Postgres client authentication rules
+├── pgbouncer_hba.conf          # PgBouncer client rules (service users only from the internal network), template
+├── pg_hba.conf                 # Postgres client authentication rules, template
+├── render-hba.sh               # Fills the hba templates from .env when db and pgbouncer start
 ├── .env                        # Environment variables (NEVER commit!)
 ├── .gitattributes              # LF line endings for scripts and configs
 ├── .gitignore                  # Git ignore rules
 ├── README.md                   # This file
-│
-├── garage/
-│   └── garage.toml             # Optional local S3 (profile garage)
 │
 ├── rclone/
 │   └── rclone.conf             # rclone OAuth tokens (NEVER commit!)
