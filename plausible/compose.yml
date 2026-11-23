@@ -63,9 +63,12 @@ services:
       HTTP_PORT: 8000
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       CLICKHOUSE_DATABASE_URL: http://plausible_events_db:8123/plausible_events_db
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
     networks:
       - internal
       - shared-db-net
+      - default
     logging:
       driver: "json-file"
       options:
@@ -78,6 +81,7 @@ volumes:
   plausible-data:
 
 networks:
+  default:
   internal:
     internal: true
   shared-db-net:
